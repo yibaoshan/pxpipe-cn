@@ -7,8 +7,12 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
 import { createProxy, type ProxyConfig } from './core/proxy.js';
 import type { TransformOptions } from './core/transform.js';
+import { toTrackEvent, noopTracker, type Tracker, type TrackEvent } from './core/tracker.js';
 
 interface CliOpts {
   port: number;
@@ -19,6 +23,10 @@ interface CliOpts {
   minCompressChars: number;
   placement: 'system' | 'user';
   cols: number;
+  /** When true, append per-request events to eventsFile. Default-on. */
+  track: boolean;
+  /** Where to append JSONL events. Default ~/.pixelpipe/events.jsonl. */
+  eventsFile: string;
 }
 
 function envFlag(name: string, fallback: boolean): boolean {
@@ -37,6 +45,10 @@ function parseCli(argv: string[]): CliOpts {
     minCompressChars: Number(process.env.MIN_COMPRESS_CHARS ?? 2000),
     placement: (process.env.PLACEMENT as 'system' | 'user') ?? 'system',
     cols: Number(process.env.COLS ?? 100),
+    track: envFlag('PIXELPIPE_TRACK', true),
+    eventsFile:
+      process.env.PIXELPIPE_LOG ??
+      path.join(os.homedir(), '.pixelpipe', 'events.jsonl'),
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
@@ -51,6 +63,8 @@ function parseCli(argv: string[]): CliOpts {
       case '--min-chars':      o.minCompressChars = Number(eat()); break;
       case '--placement':      o.placement = eat() as 'system' | 'user'; break;
       case '--cols':           o.cols = Number(eat()); break;
+      case '--no-track':       o.track = false; break;
+      case '--events-file':    o.eventsFile = eat(); break;
       case '-h':
       case '--help':           printHelp(); process.exit(0);
       case '--version':        printVersion(); process.exit(0);
@@ -79,15 +93,21 @@ Options:
       --min-chars <N>     skip compression below this many chars (default 2000)
       --placement <where> 'system' or 'user' (default system)
       --cols <N>          soft-wrap column count (default 100)
+      --no-track          disable persistent event tracking
+      --events-file <P>   JSONL events path (default ~/.pixelpipe/events.jsonl)
   -h, --help              show this help
       --version           show version
 
 Environment:
   Same as flags via PORT, ANTHROPIC_UPSTREAM, COMPRESS, COMPRESS_TOOLS,
-  COMPRESS_SCHEMAS, MIN_COMPRESS_CHARS, PLACEMENT, COLS.
+  COMPRESS_SCHEMAS, MIN_COMPRESS_CHARS, PLACEMENT, COLS, PIXELPIPE_TRACK,
+  PIXELPIPE_LOG.
 
 Use with Claude Code:
-  ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude --exclude-dynamic-system-prompt-sections
+  ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
+
+  (pixelpipe now splits dynamic blocks itself, so the
+   --exclude-dynamic-system-prompt-sections flag is no longer required.)
 `);
 }
 
@@ -151,6 +171,120 @@ async function writeWebResponse(res: Response, out: ServerResponse): Promise<voi
   out.end();
 }
 
+// ---- FileTracker ----------------------------------------------------------
+
+/**
+ * Append-only JSONL tracker with size-based rotation. One line per request.
+ *
+ * Node-only — uses node:fs. The Worker host uses tracker.JsonLogTracker with
+ * console.log instead (Cloudflare ingests that as Workers Logs).
+ *
+ * Rotation: when the current file exceeds MAX_FILE_BYTES (100 MB by default),
+ * it's renamed to `<path>.1` (overwriting any previous .1) and a fresh file
+ * is opened. Keeps one generation of history; for longer retention pipe
+ * the file off-host yourself.
+ *
+ * Failures here NEVER propagate — the proxy must keep serving requests even
+ * if the disk is full or the path is unwritable.
+ */
+class FileTracker implements Tracker {
+  private fd: number | null = null;
+  private bytesWritten = 0;
+  private brokenLogged = false;
+  private static readonly MAX_FILE_BYTES = 100 * 1024 * 1024;
+
+  constructor(private readonly filePath: string) {}
+
+  private ensureOpen(): boolean {
+    if (this.fd != null) return true;
+    try {
+      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+    } catch {
+      /* dir may already exist or be unmkable; openSync below will surface */
+    }
+    try {
+      const st = fs.statSync(this.filePath);
+      this.bytesWritten = st.size;
+    } catch {
+      this.bytesWritten = 0;
+    }
+    try {
+      this.fd = fs.openSync(this.filePath, 'a');
+      return true;
+    } catch (err) {
+      if (!this.brokenLogged) {
+        console.error(
+          `[pixelpipe] FileTracker disabled — cannot open ${this.filePath}: ${(err as Error).message}`,
+        );
+        this.brokenLogged = true;
+      }
+      return false;
+    }
+  }
+
+  private rotate(): void {
+    if (this.fd != null) {
+      try {
+        fs.closeSync(this.fd);
+      } catch {
+        /* ignore */
+      }
+      this.fd = null;
+    }
+    try {
+      fs.renameSync(this.filePath, this.filePath + '.1');
+    } catch {
+      /* if rename fails (e.g. .1 locked) we'll just keep growing — better
+         than dropping events */
+    }
+    this.bytesWritten = 0;
+  }
+
+  emit(ev: TrackEvent): void {
+    if (!this.ensureOpen()) return;
+    try {
+      const line = JSON.stringify(ev) + '\n';
+      const buf = Buffer.from(line, 'utf8');
+      fs.writeSync(this.fd!, buf);
+      this.bytesWritten += buf.length;
+      if (this.bytesWritten > FileTracker.MAX_FILE_BYTES) this.rotate();
+    } catch (err) {
+      if (!this.brokenLogged) {
+        console.error(
+          `[pixelpipe] FileTracker write failed: ${(err as Error).message}`,
+        );
+        this.brokenLogged = true;
+      }
+    }
+  }
+
+  flush(): void {
+    if (this.fd != null) {
+      try {
+        fs.fsyncSync(this.fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  close(): void {
+    if (this.fd != null) {
+      try {
+        fs.fsyncSync(this.fd);
+      } catch {
+        /* ignore */
+      }
+      try {
+        fs.closeSync(this.fd);
+      } catch {
+        /* ignore */
+      }
+      this.fd = null;
+    }
+  }
+}
+
 // ---- main ----------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -163,14 +297,37 @@ async function main(): Promise<void> {
     placement: opts.placement,
     cols: opts.cols,
   };
+  const tracker: Tracker = opts.track ? new FileTracker(opts.eventsFile) : noopTracker;
+
   const config: ProxyConfig = {
     upstream: opts.upstream,
     transform,
     onRequest: (e) => {
+      // Terse human-readable console line.
       const tag = e.info?.compressed
         ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B`
-        : e.info?.reason ?? '';
-      console.log(`[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}`);
+        : (e.info?.reason ?? '');
+      const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
+      const inputTokens = e.usage?.input_tokens ?? 0;
+      const usageTag =
+        e.usage !== undefined
+          ? ` tokens=${inputTokens}+${e.usage.output_tokens ?? 0} cache_read=${cacheRead}`
+          : '';
+      console.log(
+        `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}${usageTag}`,
+      );
+
+      // Canary: surface unknown tag-shaped blocks so a Claude Code release
+      // that adds a new dynamic tag is caught within hours.
+      if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {
+        console.warn(
+          `[pixelpipe warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}  ` +
+            `— may need to add to DYNAMIC_BLOCK_TAGS in src/core/transform.ts`,
+        );
+      }
+
+      // Persistent JSONL event for offline analysis (pixelpipe stats etc.).
+      tracker.emit(toTrackEvent(e));
     },
   };
   const handle = createProxy(config);
@@ -191,11 +348,17 @@ async function main(): Promise<void> {
 
   server.listen(opts.port, () => {
     console.log(`[pixelpipe] listening on http://127.0.0.1:${opts.port} → ${opts.upstream}`);
-    console.log(`[pixelpipe] config: compress=${opts.compress} tools=${opts.compressTools} schemas=${opts.compressSchemas} min=${opts.minCompressChars} placement=${opts.placement} cols=${opts.cols}`);
+    console.log(
+      `[pixelpipe] config: compress=${opts.compress} tools=${opts.compressTools} schemas=${opts.compressSchemas} min=${opts.minCompressChars} placement=${opts.placement} cols=${opts.cols}`,
+    );
+    if (opts.track) console.log(`[pixelpipe] tracking events → ${opts.eventsFile}`);
+    else console.log('[pixelpipe] tracking disabled (--no-track or PIXELPIPE_TRACK=0)');
   });
 
   const shutdown = (sig: string) => {
     console.log(`[pixelpipe] ${sig} — shutting down`);
+    // Flush+close the tracker so we don't drop the last few events on exit.
+    if (tracker instanceof FileTracker) tracker.close();
     server.close(() => process.exit(0));
   };
   process.on('SIGINT', () => shutdown('SIGINT'));

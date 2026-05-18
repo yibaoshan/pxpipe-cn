@@ -13,6 +13,7 @@
 
 import { createProxy, type ProxyConfig } from './core/proxy.js';
 import type { TransformOptions } from './core/transform.js';
+import { toTrackEvent, JsonLogTracker, noopTracker, type Tracker } from './core/tracker.js';
 
 export interface Env {
   ANTHROPIC_UPSTREAM?: string;
@@ -24,6 +25,10 @@ export interface Env {
   MIN_COMPRESS_CHARS?: string;
   PLACEMENT?: string;
   COLS?: string;
+  /** When "0" / "false", disable per-request event JSON logs. Default-on.
+   *  Cloudflare ingests console.log as Workers Logs; pipe via Logpush to
+   *  R2/S3 for the same JSONL shape Node writes to disk. */
+  PIXELPIPE_TRACK?: string;
 }
 
 const truthy = (v: string | undefined, fallback: boolean): boolean =>
@@ -39,16 +44,32 @@ export default {
       placement: (env.PLACEMENT as 'system' | 'user') ?? 'system',
       cols: env.COLS ? Number(env.COLS) : 100,
     };
+    const trackingOn = truthy(env.PIXELPIPE_TRACK, true);
+    // Workers Logs ingests stdout as separate log lines. Emit one JSON line
+    // per event so downstream (Logpush → R2/S3) reads the same JSONL shape
+    // the Node host writes to disk.
+    const tracker: Tracker = trackingOn ? new JsonLogTracker((s) => console.log(s)) : noopTracker;
+
     const config: ProxyConfig = {
       upstream: env.ANTHROPIC_UPSTREAM ?? 'https://api.anthropic.com',
       apiKey: env.ANTHROPIC_API_KEY,
       transform,
-      // Note: console.log in Workers is captured by `wrangler tail`.
       onRequest: (e) => {
+        // Terse human-readable line (separate from the JSON event below;
+        // shows up in `wrangler tail`).
         const tag = e.info?.compressed
           ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B`
-          : e.info?.reason ?? '';
-        console.log(`${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}`);
+          : (e.info?.reason ?? '');
+        const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
+        console.log(`${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag} cache_read=${cacheRead}`);
+
+        if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {
+          console.warn(
+            `[pixelpipe warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}`,
+          );
+        }
+
+        tracker.emit(toTrackEvent(e));
       },
     };
     const handle = createProxy(config);
