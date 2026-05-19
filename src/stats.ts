@@ -1,22 +1,17 @@
 /**
- * `pixelpipe stats` — read the JSONL events file (or any file matching the
- * tracker.ts schema) and print aggregate metrics about how the proxy is
- * doing.
+ * Aggregate metrics over a stream of TrackEvents. Pure data-layer module —
+ * the dashboard's `/api/stats.json` endpoint imports `aggregateEventsFile`
+ * + `summaryToJson` from here. There is no longer a CLI entrypoint; the
+ * live dashboard at http://127.0.0.1:47821/ surfaces everything this used
+ * to print.
  *
  * Node-only (uses node:fs). Streams the file line-by-line so a 100 MB log
- * doesn't blow the heap. The aggregator itself is pure — fed a sequence of
- * TrackEvent and produces a Summary — so a Workers-side dashboard could
- * reuse it later by extracting it into core/.
- *
- * Exit codes:
- *   0  ok, summary printed
- *   1  events file missing or unreadable
- *   2  events file exists but contained zero valid lines
+ * doesn't blow the heap. The aggregator itself (`newSummary` / `fold`) is
+ * pure — fed a sequence of TrackEvents and produces a Summary — so a
+ * Workers-side dashboard could reuse it later by extracting it into core/.
  */
 
 import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as os from 'node:os';
 import * as readline from 'node:readline';
 import type { TrackEvent } from './core/tracker.js';
 
@@ -250,54 +245,23 @@ export function renderTextReport(s: Summary): string {
   return lines.join('\n');
 }
 
-// ---- entrypoint -----------------------------------------------------------
+// ---- file-backed aggregation (used by the dashboard) ----------------------
 
-interface StatsOpts {
-  file: string;
-  json: boolean;
-}
-
-function parseArgs(argv: string[]): StatsOpts {
-  const opts: StatsOpts = {
-    file:
-      process.env.PIXELPIPE_LOG ??
-      path.join(os.homedir(), '.pixelpipe', 'events.jsonl'),
-    json: false,
-  };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]!;
-    if (a === '--file' || a === '-f') opts.file = argv[++i] ?? opts.file;
-    else if (a === '--json') opts.json = true;
-    else if (a === '-h' || a === '--help') {
-      console.log(`pixelpipe stats — aggregate metrics from events JSONL
-
-Usage:
-  pixelpipe stats [--file <path>] [--json]
-
-Options:
-  -f, --file <path>   events JSONL to read (default ~/.pixelpipe/events.jsonl
-                      or PIXELPIPE_LOG env var)
-      --json          emit the Summary object as JSON instead of a text report
-  -h, --help          show this help
-`);
-      process.exit(0);
-    }
-  }
-  return opts;
-}
-
-export async function runStats(argv: string[]): Promise<number> {
-  const opts = parseArgs(argv);
-
-  if (!fs.existsSync(opts.file)) {
-    console.error(`[pixelpipe stats] events file not found: ${opts.file}`);
-    console.error(
-      `[pixelpipe stats] (run pixelpipe and send a request first, or set PIXELPIPE_LOG)`,
-    );
-    return 1;
-  }
-
-  const stream = fs.createReadStream(opts.file, { encoding: 'utf8' });
+/**
+ * Stream an events JSONL file and fold every row into a Summary. Returns the
+ * Summary plus a parsed/dropped tally so callers can detect empty/garbage
+ * inputs. The dashboard wraps this for the /api/stats.json endpoint.
+ *
+ * Note: this is a full re-read on every call. The dashboard already has a
+ * 50-event ring buffer of the *recent* slice; stats need the full history
+ * to compute cache-hit-rate over thousands of requests. ~1.5 MB JSONL
+ * streams in well under 100 ms on an SSD.
+ */
+export async function aggregateEventsFile(
+  file: string,
+): Promise<{ summary: Summary; parsed: number; dropped: number } | undefined> {
+  if (!fs.existsSync(file)) return undefined;
+  const stream = fs.createReadStream(file, { encoding: 'utf8' });
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
   const summary = newSummary();
   let parsed = 0;
@@ -312,30 +276,42 @@ export async function runStats(argv: string[]): Promise<number> {
       dropped++;
     }
   }
+  return { summary, parsed, dropped };
+}
 
-  if (parsed === 0) {
-    console.error(`[pixelpipe stats] no valid events in ${opts.file}`);
-    return 2;
-  }
-
-  if (opts.json) {
-    // Maps don't survive JSON.stringify — convert to plain objects.
-    process.stdout.write(
-      JSON.stringify(
-        {
-          ...summary,
-          skipReasons: Object.fromEntries(summary.skipReasons),
-          byCwd: Object.fromEntries(summary.byCwd),
-          systemShaHist: Object.fromEntries(summary.systemShaHist),
-          unknownTags: Object.fromEntries(summary.unknownTags),
-        },
-        null,
-        2,
-      ) + '\n',
-    );
-  } else {
-    process.stdout.write(renderTextReport(summary) + '\n');
-    if (dropped > 0) console.error(`(${dropped} unparseable line(s) skipped)`);
-  }
-  return 0;
+/**
+ * Convert a Summary to a JSON-serializable shape for the dashboard's
+ * /api/stats.json endpoint. JSON.stringify drops Map entries silently, so
+ * we materialize the top-N entries of each map into plain [key, value]
+ * tuples. Caps each map at 20 entries to keep the response bounded.
+ */
+export function summaryToJson(s: Summary): Record<string, unknown> {
+  const topN = <K, V>(m: Map<K, V>, n = 20): [K, V][] =>
+    [...m.entries()].slice(0, n);
+  const sortedDur = [...s.durationMs].sort((a, b) => a - b);
+  const sortedFB = [...s.firstByteMs].sort((a, b) => a - b);
+  return {
+    total: s.total,
+    ok2xx: s.ok2xx,
+    err4xx: s.err4xx,
+    err5xx: s.err5xx,
+    compressed: s.compressed,
+    passthrough: s.passthrough,
+    origCharsTotal: s.origCharsTotal,
+    imageBytesTotal: s.imageBytesTotal,
+    inputTokensTotal: s.inputTokensTotal,
+    outputTokensTotal: s.outputTokensTotal,
+    cacheCreateTokensTotal: s.cacheCreateTokensTotal,
+    cacheReadTokensTotal: s.cacheReadTokensTotal,
+    cacheHitEvents: s.cacheHitEvents,
+    eventsWithUsage: s.eventsWithUsage,
+    durationP50: percentile(sortedDur, 50),
+    durationP95: percentile(sortedDur, 95),
+    firstByteP50: percentile(sortedFB, 50),
+    firstByteP95: percentile(sortedFB, 95),
+    skipReasons: topN(s.skipReasons),
+    byCwd: topN(s.byCwd),
+    systemShaHist: topN(s.systemShaHist),
+    unknownTags: topN(s.unknownTags),
+  };
 }

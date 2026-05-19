@@ -12,8 +12,18 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { createProxy, type ProxyConfig } from './core/proxy.js';
 import type { TransformOptions } from './core/transform.js';
-import { toTrackEvent, noopTracker, type Tracker, type TrackEvent } from './core/tracker.js';
-import { DashboardState, dashboardPath } from './dashboard.js';
+import {
+  toTrackEvent,
+  noopTracker,
+  TRACK_BODY_INLINE_MAX,
+  type Tracker,
+  type TrackEvent,
+} from './core/tracker.js';
+import {
+  DashboardState,
+  dashboardPath,
+  type DashboardRoute,
+} from './dashboard.js';
 
 interface CliOpts {
   port: number;
@@ -100,7 +110,9 @@ function printHelp(): void {
 
 Usage:
   pixelpipe [options]                run the proxy
-  pixelpipe stats [--file <p>]       summarize ~/.pixelpipe/events.jsonl
+
+Stats, sessions, and cleanup tools all live in the live dashboard at
+  http://127.0.0.1:<port>/  (default port 47821)
 
 Options:
   -p, --port <N>          listen port (default 47821)
@@ -193,6 +205,99 @@ async function writeWebResponse(res: Response, out: ServerResponse): Promise<voi
     if (value) out.write(value);
   }
   out.end();
+}
+
+/** Read the entire request body as text. Bounded at 1 MiB — every dashboard
+ *  POST is tiny JSON (a few hundred bytes). The cap is a defense against a
+ *  pathological/malicious client; legitimate proxy traffic doesn't hit these
+ *  routes. */
+async function readRequestBody(req: IncomingMessage): Promise<string> {
+  const MAX = 1024 * 1024;
+  let bytes = 0;
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    const b = chunk as Buffer;
+    bytes += b.byteLength;
+    if (bytes > MAX) throw new Error('request body too large');
+    chunks.push(b);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/**
+ * Dispatch a matched DashboardRoute to the appropriate handler. Returns
+ * undefined when the method/route combination doesn't apply so the caller
+ * can fall through to the upstream proxy (e.g. a GET path that's only
+ * defined for POST). Keeps the createServer body small + readable.
+ */
+async function dispatchDashboard(
+  dashboard: DashboardState,
+  route: DashboardRoute,
+  req: IncomingMessage,
+  url: URL,
+  port: number,
+): Promise<Response | undefined> {
+  const method = req.method ?? 'GET';
+  switch (route.kind) {
+    case 'html':
+      if (method !== 'GET') return undefined;
+      return dashboard.serveHtml(port);
+    case 'stats':
+      if (method !== 'GET') return undefined;
+      return dashboard.serveStats();
+    case 'recent':
+      if (method !== 'GET') return undefined;
+      return dashboard.serveRecent();
+    case 'png':
+      if (method !== 'GET') return undefined;
+      return dashboard.servePng();
+    case 'session-html':
+      if (method !== 'GET') return undefined;
+      return dashboard.serveSessionHtml(route.sessionId, port);
+    case 'api-sessions': {
+      if (method !== 'GET') return undefined;
+      return dashboard.serveSessionsJson({
+        project: url.searchParams.get('project') ?? undefined,
+        since: url.searchParams.get('since') ?? undefined,
+      });
+    }
+    case 'api-session': {
+      if (method !== 'GET') return undefined;
+      const includeBodies = url.searchParams.get('include_bodies') === '1';
+      return dashboard.serveSessionJson(route.sessionId, includeBodies);
+    }
+    case 'api-disk':
+      if (method !== 'GET') return undefined;
+      return dashboard.serveDiskJson();
+    case 'api-stats':
+      if (method !== 'GET') return undefined;
+      return dashboard.serveApiStats();
+    case 'api-prune': {
+      if (method !== 'POST') {
+        return new Response(
+          JSON.stringify({ error: 'use POST' }),
+          { status: 405, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      let body: Record<string, unknown> = {};
+      try {
+        const raw = await readRequestBody(req);
+        body = raw ? JSON.parse(raw) : {};
+      } catch (e) {
+        return new Response(
+          JSON.stringify({ error: 'bad request body', detail: (e as Error).message }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return dashboard.handlePrune({
+        force: body.force === true,
+        olderThanDays:
+          typeof body.olderThanDays === 'number' ? body.olderThanDays : undefined,
+        keepLast: typeof body.keepLast === 'number' ? body.keepLast : undefined,
+        sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
+      });
+    }
+  }
 }
 
 // ---- FileTracker ----------------------------------------------------------
@@ -309,18 +414,49 @@ class FileTracker implements Tracker {
   }
 }
 
+// ---- 4xx body sidecar writer ---------------------------------------------
+
+/**
+ * For oversized 4xx body samples that won't fit inline in the JSONL row, we
+ * write them to a sidecar file at `<dir>/${ts}-${sha8}.json.gz`. The path
+ * lands in the event as `req_body_sample_path`. Survives log rotation and
+ * stays out of the streaming dashboard.
+ *
+ * Failure mode: directory unwritable or write fails → returns undefined and
+ * the body sample is silently dropped (we still keep the sha8 and error_body
+ * for diagnostics; the request itself was never blocked by this).
+ */
+async function maybeWriteBodySidecar(
+  bytesGz: Uint8Array,
+  sha8: string | undefined,
+  dir: string,
+): Promise<string | undefined> {
+  try {
+    // Lazy mkdir — only when we actually need to write.
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    return undefined;
+  }
+  // Filename: timestamp + sha8 keeps collisions effectively impossible and
+  // makes the file naturally sortable. Sha8 fallback covers the edge case
+  // where the hash wasn't computed (zero-byte body, etc.).
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const tag = sha8 ?? 'nohash';
+  const filePath = path.join(dir, `${ts}-${tag}.json.gz`);
+  try {
+    await fs.promises.writeFile(filePath, bytesGz);
+    return filePath;
+  } catch {
+    return undefined;
+  }
+}
+
 // ---- main ----------------------------------------------------------------
 
 async function main(): Promise<void> {
-  // Subcommand dispatch — before parseCli so flag parsing doesn't choke on
-  // `stats`'s own flags.
+  // No subcommands — pixelpipe is just the proxy. Stats / sessions / cleanup
+  // tools live in the dashboard (see http://127.0.0.1:${port}/).
   const argv = process.argv.slice(2);
-  if (argv[0] === 'stats') {
-    const { runStats } = await import('./stats.js');
-    const code = await runStats(argv.slice(1));
-    process.exit(code);
-  }
-
   const opts = parseCli(argv);
   const transform: TransformOptions = {
     compress: opts.compress,
@@ -336,9 +472,19 @@ async function main(): Promise<void> {
   };
   const tracker: Tracker = opts.track ? new FileTracker(opts.eventsFile) : noopTracker;
 
+  // Sidecar dir for oversized 4xx request-body samples. Lives next to the
+  // events.jsonl so a single `rm -rf` cleans up both. Lazy-mkdir'd on first
+  // sidecar write (see maybeWriteBodySidecar).
+  const bodySidecarDir = path.join(path.dirname(opts.eventsFile), '4xx-bodies');
+
   // Live dashboard state — populated on every request via onRequest below,
-  // served via the route interception in front of the proxy handler.
-  const dashboard = new DashboardState();
+  // served via the route interception in front of the proxy handler. The
+  // SessionsPaths handle lets the dashboard surface session/disk/stats data
+  // without reaching back into module-scope globals.
+  const dashboard = new DashboardState({
+    eventsFile: opts.eventsFile,
+    sidecarDir: bodySidecarDir,
+  });
   // Seed the "recent requests" table from the JSONL log so a process restart
   // doesn't reset what you can see in the UI. Best-effort; ignored on error.
   await dashboard.replay(opts.eventsFile).catch(() => {});
@@ -346,7 +492,7 @@ async function main(): Promise<void> {
   const config: ProxyConfig = {
     upstream: opts.upstream,
     transform,
-    onRequest: (e) => {
+    onRequest: async (e) => {
       // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips
       // info.firstImagePng, so capturing has to happen on the raw event.
       dashboard.update(e);
@@ -368,6 +514,16 @@ async function main(): Promise<void> {
         `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag}${usageTag}`,
       );
 
+      // Surface upstream 4xx error bodies inline so a regression in the
+      // request shape is obvious without having to grep events.jsonl. The
+      // tracker JSONL already has the full ~2 KiB capture.
+      if (e.errorBody) {
+        const trimmed = e.errorBody.length > 400
+          ? e.errorBody.slice(0, 400) + '…'
+          : e.errorBody;
+        console.warn(`[pixelpipe ${e.status}] upstream body: ${trimmed}`);
+      }
+
       // Canary: surface unknown tag-shaped blocks so a Claude Code release
       // that adds a new dynamic tag is caught within hours.
       if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {
@@ -375,6 +531,23 @@ async function main(): Promise<void> {
           `[pixelpipe warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}  ` +
             `— may need to add to DYNAMIC_BLOCK_TAGS (per-turn) or KNOWN_STATIC_TAGS (static) in src/core/transform.ts`,
         );
+      }
+
+      // If the proxy captured a gzipped 4xx body that won't fit inline in
+      // the JSONL row, write it to a sidecar file and put the path on the
+      // event instead. Threshold: gz_bytes * 4/3 > inline cap (b64 expansion).
+      if (e.reqBodyGz && e.reqBodyGz.byteLength * 4 > TRACK_BODY_INLINE_MAX * 3) {
+        const writtenPath = await maybeWriteBodySidecar(
+          e.reqBodyGz,
+          e.reqBodySha8,
+          bodySidecarDir,
+        );
+        if (writtenPath) {
+          e.reqBodySamplePath = writtenPath;
+          e.reqBodyGz = undefined; // tracker will pick up the path instead
+        }
+        // If write failed: leave reqBodyGz; the tracker will silently drop
+        // it (still too big to inline). We never lose the sha8 / error_body.
       }
 
       // Persistent JSONL event for offline analysis (pixelpipe stats etc.).
@@ -388,18 +561,11 @@ async function main(): Promise<void> {
       .then(async () => {
         // Local dashboard routes — handled BEFORE the proxy so they never hit
         // api.anthropic.com (which would 404 them).
-        if (req.method === 'GET') {
-          const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-          const kind = dashboardPath(url.pathname);
-          if (kind) {
-            const webRes =
-              kind === 'html'
-                ? dashboard.serveHtml(opts.port)
-                : kind === 'stats'
-                  ? dashboard.serveStats()
-                  : kind === 'recent'
-                    ? dashboard.serveRecent()
-                    : dashboard.servePng();
+        const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+        const route = dashboardPath(url.pathname);
+        if (route) {
+          const webRes = await dispatchDashboard(dashboard, route, req, url, opts.port);
+          if (webRes) {
             await writeWebResponse(webRes, res);
             return;
           }

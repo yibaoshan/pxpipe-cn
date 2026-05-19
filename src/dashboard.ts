@@ -1,17 +1,30 @@
 /**
- * Live dashboard for the Node host. Serves an HTML page + four JSON/PNG
- * endpoints that poll for fresh data every ~2s:
+ * Live dashboard for the Node host. Serves the main HTML page, per-session
+ * detail pages, and JSON polling endpoints. All "/api/*.json" endpoints
+ * recompute from disk on every request — pixelpipe doesn't have a query
+ * layer, but a 1.5 MB JSONL streams in well under 100 ms.
  *
- *   GET /             , GET /dashboard       → HTML page
- *   GET /proxy-stats                          → JSON aggregate (running totals)
- *   GET /proxy-recent                         → JSON ring buffer of recent requests
- *   GET /proxy-latest-png[?crop=N]            → raw PNG of the latest rendered image
+ * Legacy live-poll endpoints (left in place, the existing tick() loop uses
+ * them):
+ *
+ *   GET  /, /dashboard               → main HTML page
+ *   GET  /proxy-stats                → JSON aggregate over the in-mem ring
+ *   GET  /proxy-recent               → JSON ring buffer of recent requests
+ *   GET  /proxy-latest-png[?crop=N]  → raw PNG of the latest rendered image
+ *
+ * New session / cleanup endpoints (added in this PR):
+ *
+ *   GET  /sessions/${id}             → HTML detail page for one session
+ *   GET  /api/sessions.json          → grouped sessions (sha8 + project + counts)
+ *   GET  /api/sessions/${id}.json    → events + metadata for one session
+ *   GET  /api/disk.json              → events.jsonl + 4xx-bodies disk usage
+ *   GET  /api/stats.json             → full-history aggregate (formerly `pixelpipe stats`)
+ *   POST /api/sessions/prune         → atomic prune by older-than / keep-last / session
  *
  * Metric formulas and HTML shell originally ported from the Python reference
  * implementation (deleted after live cache-rate validation hit 98.7% by tokens).
  *
- * Node-only by design (uses node:fs for startup replay + node:zlib for the
- * preview crop). The Worker host doesn't expose a dashboard; use Workers Logs.
+ * Node-only by design. Workers host has no dashboard; use Workers Logs.
  *
  * Memory bound: ring buffer cap 50 events + ONE latest PNG (replaced on each
  * compressed request). At a typical 75 KB PNG that's well under 1 MB resident.
@@ -21,6 +34,21 @@ import * as fs from 'node:fs';
 import * as readline from 'node:readline';
 import type { ProxyEvent } from './core/proxy.js';
 import type { TrackEvent } from './core/tracker.js';
+import {
+  aggregateSessions,
+  claudeCodeMap,
+  collectSessionEvents,
+  diskUsage,
+  filterSessions,
+  prune,
+  redactEvent,
+  type ClaudeCodeSessionRef,
+  type ListOptions,
+  type PruneOptions,
+  type SessionsPaths,
+  type SessionSummary,
+} from './sessions.js';
+import { aggregateEventsFile, summaryToJson } from './stats.js';
 
 const RECENT_CAP = 50;
 
@@ -128,6 +156,24 @@ export class DashboardState {
   private latestPngMeta = '';
   private latestPngWidth = 0;
   private latestPngHeight = 0;
+  /** Resolved disk paths for the events.jsonl + 4xx-bodies sidecar dir. The
+   *  new sessions / cleanup endpoints need this; legacy callers that don't
+   *  pass `paths` opt out of those endpoints by returning 503. */
+  private readonly paths: SessionsPaths | undefined;
+
+  /** Test hook: when set, /api/sessions.json and /api/sessions/${id}.json
+   *  call this instead of `claudeCodeMap()` with the real `~/.claude/projects/`
+   *  path. Lets unit tests run in tens of ms instead of scanning hundreds of
+   *  the developer's actual Claude Code session files. */
+  private readonly ccMapFn: () => Promise<Map<string, ClaudeCodeSessionRef>>;
+
+  constructor(
+    paths?: SessionsPaths,
+    ccMapFn?: () => Promise<Map<string, ClaudeCodeSessionRef>>,
+  ) {
+    this.paths = paths;
+    this.ccMapFn = ccMapFn ?? (() => claudeCodeMap());
+  }
 
   /** Stash the latest rendered image (called from onRequest with the raw
    *  ProxyEvent before info.firstImagePng is dropped by toTrackEvent). */
@@ -294,6 +340,121 @@ export class DashboardState {
       headers: { 'content-type': 'text/html; charset=utf-8' },
     });
   }
+
+  // ---- session / cleanup endpoints --------------------------------------
+  //
+  // Every endpoint below recomputes from disk on demand. The dashboard polls
+  // these on a 5s cadence, which is fine for a single-user dev tool — even at
+  // ~3k events / 1.5 MB the round-trip is <100ms on a warm SSD.
+
+  /** GET /api/sessions.json — grouped sessions enriched with the Claude Code
+   *  cross-reference. The body is paged via top-level `sessions` array; the
+   *  client renders the table row-by-row. */
+  async serveSessionsJson(opts: ListOptions = {}): Promise<Response> {
+    if (!this.paths) return notConfigured('sessions');
+    const [{ sessions }, ccMap] = await Promise.all([
+      aggregateSessions(this.paths),
+      this.ccMapFn(),
+    ]);
+    const rows = filterSessions(sessions, opts);
+    const enriched = rows.map((s) => ({
+      ...s,
+      claudeCode: ccMap.get(s.id) ?? null,
+    }));
+    return jsonResponse({ sessions: enriched, count: enriched.length });
+  }
+
+  /** GET /api/sessions/${id}.json — events for one session + its Claude Code
+   *  ref. Bodies are redacted by default (set ?include_bodies=1 to opt in). */
+  async serveSessionJson(
+    id: string,
+    includeBodies: boolean,
+  ): Promise<Response> {
+    if (!this.paths) return notConfigured('session detail');
+    const [events, ccMap] = await Promise.all([
+      collectSessionEvents(this.paths, id),
+      this.ccMapFn(),
+    ]);
+    if (events.length === 0) {
+      return jsonResponse({ error: 'session not found', id }, 404);
+    }
+    return jsonResponse({
+      id,
+      claudeCode: ccMap.get(id) ?? null,
+      includeBodies,
+      events: events.map((e) => redactEvent(e, includeBodies)),
+    });
+  }
+
+  /** GET /sessions/${id} — HTML detail page (uses /api/sessions/${id}.json). */
+  serveSessionHtml(id: string, port: number): Response {
+    const html = SESSION_DETAIL_HTML.replace(/__PORT__/g, String(port)).replace(
+      /__SESSION_ID__/g,
+      escapeHtml(id),
+    );
+    return new Response(html, {
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  }
+
+  /** GET /api/disk.json — current on-disk usage. */
+  serveDiskJson(): Response {
+    if (!this.paths) return notConfigured('disk usage');
+    const d = diskUsage(this.paths);
+    return jsonResponse({ ...d, paths: this.paths });
+  }
+
+  /** GET /api/stats.json — full-history aggregate. Migrated from the
+   *  former `pixelpipe stats` CLI. */
+  async serveApiStats(): Promise<Response> {
+    if (!this.paths) return notConfigured('stats');
+    const result = await aggregateEventsFile(this.paths.eventsFile);
+    if (!result) {
+      return jsonResponse({
+        error: 'no events file yet',
+        path: this.paths.eventsFile,
+      }, 404);
+    }
+    return jsonResponse({
+      parsed: result.parsed,
+      dropped: result.dropped,
+      summary: summaryToJson(result.summary),
+    });
+  }
+
+  /** POST /api/sessions/prune — destructive but confirmed client-side. The
+   *  client UI shows a `confirm()` dialog before calling this with
+   *  `force: true`. We still default force=false at the wire level. */
+  async handlePrune(body: PruneOptions): Promise<Response> {
+    if (!this.paths) return notConfigured('prune');
+    const report = await prune(this.paths, {
+      force: body.force === true,
+      olderThanDays: body.olderThanDays,
+      keepLast: body.keepLast,
+      sessionId: body.sessionId,
+    });
+    return jsonResponse(report);
+  }
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      'content-type': 'application/json',
+      'access-control-allow-origin': '*',
+    },
+  });
+}
+
+function notConfigured(what: string): Response {
+  // The dashboard was constructed without SessionsPaths (e.g. a legacy host
+  // that doesn't track to disk). Return 503 so the client can surface a
+  // helpful error rather than failing silently.
+  return jsonResponse(
+    { error: `${what} unavailable: dashboard not configured with event paths` },
+    503,
+  );
 }
 
 function round1(n: number): number {
@@ -303,12 +464,53 @@ function round4(n: number): number {
   return Math.round(n * 10000) / 10000;
 }
 
+/** Server-side HTML escape for values we interpolate into the session-detail
+ *  template. Kept tiny on purpose: we only emit text into attributes / text
+ *  nodes, no rich markup. */
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => {
+    switch (c) {
+      case '&': return '&amp;';
+      case '<': return '&lt;';
+      case '>': return '&gt;';
+      case '"': return '&quot;';
+      default: return '&#39;';
+    }
+  });
+}
+
+/** Result of route-matching a dashboard URL. The legacy `kind` values
+ *  (html/stats/recent/png) stay; new routes return a dedicated kind plus an
+ *  optional sessionId for the dynamic /sessions/${id} + /api/sessions/${id}
+ *  variants. */
+export type DashboardRoute =
+  | { kind: 'html' }
+  | { kind: 'stats' } // /proxy-stats — legacy live counter
+  | { kind: 'recent' } // /proxy-recent — legacy ring buffer
+  | { kind: 'png' } // /proxy-latest-png
+  | { kind: 'api-sessions' } // /api/sessions.json
+  | { kind: 'api-session'; sessionId: string } // /api/sessions/${id}.json
+  | { kind: 'api-disk' } // /api/disk.json
+  | { kind: 'api-stats' } // /api/stats.json
+  | { kind: 'api-prune' } // /api/sessions/prune (POST)
+  | { kind: 'session-html'; sessionId: string }; // /sessions/${id}
+
 /** Match dashboard paths (handle query strings on /proxy-latest-png). */
-export function dashboardPath(pathname: string): 'html' | 'stats' | 'recent' | 'png' | null {
-  if (pathname === '/' || pathname === '/dashboard') return 'html';
-  if (pathname === '/proxy-stats') return 'stats';
-  if (pathname === '/proxy-recent') return 'recent';
-  if (pathname === '/proxy-latest-png') return 'png';
+export function dashboardPath(pathname: string): DashboardRoute | null {
+  if (pathname === '/' || pathname === '/dashboard') return { kind: 'html' };
+  if (pathname === '/proxy-stats') return { kind: 'stats' };
+  if (pathname === '/proxy-recent') return { kind: 'recent' };
+  if (pathname === '/proxy-latest-png') return { kind: 'png' };
+  if (pathname === '/api/sessions.json') return { kind: 'api-sessions' };
+  if (pathname === '/api/disk.json') return { kind: 'api-disk' };
+  if (pathname === '/api/stats.json') return { kind: 'api-stats' };
+  if (pathname === '/api/sessions/prune') return { kind: 'api-prune' };
+  // /api/sessions/${id}.json — id is [a-f0-9]{1,16} (sha8 prefix) plus
+  // '<unknown>' literal. Reject anything else to keep paths sanitized.
+  const apiSess = /^\/api\/sessions\/([A-Za-z0-9<>_-]{1,32})\.json$/.exec(pathname);
+  if (apiSess) return { kind: 'api-session', sessionId: apiSess[1]! };
+  const sessHtml = /^\/sessions\/([A-Za-z0-9<>_-]{1,32})$/.exec(pathname);
+  if (sessHtml) return { kind: 'session-html', sessionId: sessHtml[1]! };
   return null;
 }
 
@@ -405,6 +607,55 @@ const DASHBOARD_HTML = `<!doctype html>
   </div>
 </div>
 
+<div class="panel" style="margin-bottom:22px">
+  <h2>sessions <span class="small" id="sess_count" style="color:#6e7681"></span></h2>
+  <div class="small" id="sess_status" style="margin-bottom:12px;color:#6e7681">loading...</div>
+  <table>
+    <thead>
+      <tr>
+        <th>session</th>
+        <th>project</th>
+        <th>claude code</th>
+        <th>first seen</th>
+        <th>last seen</th>
+        <th class="num">reqs</th>
+        <th class="num">tokens saved</th>
+        <th class="num">cache read</th>
+        <th class="num">disk</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="sess_rows"></tbody>
+  </table>
+</div>
+
+<div class="row">
+  <div class="panel">
+    <h2>stats <span class="small" style="color:#6e7681">(full history)</span></h2>
+    <div class="small" id="stats_status" style="margin-bottom:12px;color:#6e7681">loading...</div>
+    <table>
+      <tbody id="stats_rows"></tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <h2>cleanup</h2>
+    <div class="small" id="disk_status" style="margin-bottom:12px;color:#6e7681">loading...</div>
+    <table>
+      <tbody id="disk_rows"></tbody>
+    </table>
+    <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
+      <label class="small" for="prune_days" style="color:#6e7681">prune older than</label>
+      <select id="prune_days" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;padding:4px">
+        <option value="7">7 days</option>
+        <option value="30" selected>30 days</option>
+        <option value="90">90 days</option>
+      </select>
+      <button id="prune_btn" type="button" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:6px 12px;cursor:pointer">prune</button>
+    </div>
+    <div class="small" id="prune_result" style="margin-top:10px;color:#6e7681"></div>
+  </div>
+</div>
+
 <script>
 async function tick() {
   try {
@@ -461,7 +712,388 @@ function formatDuration(s) {
   const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
   return (h>0?h+'h ':'') + (m>0?m+'m ':'') + sec + 's';
 }
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  if (n < 1024) return n + ' B';
+  if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+  if (n < 1024*1024*1024) return (n/(1024*1024)).toFixed(1) + ' MB';
+  return (n/(1024*1024*1024)).toFixed(2) + ' GB';
+}
+function fmtTs(iso) {
+  if (!iso) return '-';
+  return String(iso).replace('T', ' ').slice(0, 19);
+}
+function shortPath(p) {
+  if (!p) return '-';
+  const parts = String(p).split('/');
+  return parts[parts.length - 1] || p;
+}
+
+// ---- session table: diff-render row by row -------------------------------
+//
+// Smooth updates: keep a Map<id, <tr>> across ticks. On each refresh we walk
+// the new sessions list and update text in-place when an id already has a
+// row; rows for vanished ids are removed; new ids get appended in last_seen
+// order. This avoids the visible flash that an innerHTML wipe would cause.
+const sessRowEls = new Map();
+
+function sessRowHtml(s) {
+  const cc = s.claudeCode;
+  const ccLabel = cc
+    ? '<span title="' + escapeHtml(cc.projectPath) + '/' + escapeHtml(cc.sessionId) + '">'
+      + escapeHtml(cc.sessionId.slice(0,8)) + '...</span>'
+    : '<span style="color:#6e7681">-</span>';
+  const disk = fmtBytes((s.jsonlBytes||0) + (s.sidecarBytes||0));
+  const projShort = s.project ? escapeHtml(shortPath(s.project)) : '<span style="color:#6e7681">-</span>';
+  return ''
+    + '<td><a href="/sessions/' + encodeURIComponent(s.id) + '" style="color:#58a6ff">'
+    +   escapeHtml(s.id) + '</a></td>'
+    + '<td>' + projShort + '</td>'
+    + '<td class="small">' + ccLabel + '</td>'
+    + '<td class="small">' + escapeHtml(fmtTs(s.firstSeen)) + '</td>'
+    + '<td class="small">' + escapeHtml(fmtTs(s.lastSeen)) + '</td>'
+    + '<td class="num">' + numFmt(s.requestCount) + '</td>'
+    + '<td class="num">' + numFmt(s.tokensSavedEst) + '</td>'
+    + '<td class="num">' + numFmt(s.cacheReadTokens) + '</td>'
+    + '<td class="num">' + escapeHtml(disk) + '</td>'
+    + '<td><button type="button" data-del="' + escapeHtml(s.id) + '" '
+    +    'style="background:#21262d;color:#f85149;border:1px solid #30363d;padding:2px 8px;cursor:pointer;font-size:11px">del</button></td>';
+}
+
+function renderSessions(payload) {
+  const rows = (payload && payload.sessions) || [];
+  document.getElementById('sess_count').textContent = '(' + rows.length + ')';
+  document.getElementById('sess_status').textContent =
+    rows.length === 0 ? 'no sessions yet - send a request through the proxy' : '';
+  const tbody = document.getElementById('sess_rows');
+  const seen = new Set();
+  let prev = null;
+  for (const s of rows) {
+    seen.add(s.id);
+    let tr = sessRowEls.get(s.id);
+    const html = sessRowHtml(s);
+    if (!tr) {
+      tr = document.createElement('tr');
+      tr.innerHTML = html;
+      sessRowEls.set(s.id, tr);
+      if (prev && prev.nextSibling) tbody.insertBefore(tr, prev.nextSibling);
+      else tbody.appendChild(tr);
+    } else if (tr.dataset.last !== html) {
+      // Only rewrite when content changed - avoids selection / focus thrash.
+      tr.innerHTML = html;
+    }
+    tr.dataset.last = html;
+    prev = tr;
+  }
+  // Drop rows for sessions that vanished (most likely just pruned).
+  for (const [id, tr] of [...sessRowEls.entries()]) {
+    if (!seen.has(id)) {
+      tr.remove();
+      sessRowEls.delete(id);
+    }
+  }
+}
+
+// ---- stats table ---------------------------------------------------------
+
+function renderStats(payload) {
+  const status = document.getElementById('stats_status');
+  if (!payload || payload.error) {
+    status.textContent = payload && payload.error ? payload.error : '(no data)';
+    return;
+  }
+  status.textContent = numFmt(payload.parsed) + ' events parsed';
+  const s = payload.summary;
+  const totalIn = (s.inputTokensTotal||0) + (s.cacheCreateTokensTotal||0) + (s.cacheReadTokensTotal||0);
+  const hitRateTok = totalIn > 0 ? ((s.cacheReadTokensTotal / totalIn) * 100).toFixed(1) + '%' : '-';
+  const hitRateEv = s.eventsWithUsage > 0 ? ((s.cacheHitEvents / s.eventsWithUsage) * 100).toFixed(1) + '%' : '-';
+  const charRatio = s.origCharsTotal > 0 ? (s.imageBytesTotal / s.origCharsTotal).toFixed(3) : '-';
+  const rows = [
+    ['requests',        numFmt(s.total)],
+    ['  2xx / 4xx / 5xx', numFmt(s.ok2xx) + ' / ' + numFmt(s.err4xx) + ' / ' + numFmt(s.err5xx)],
+    ['compressed',      numFmt(s.compressed)],
+    ['passthrough',     numFmt(s.passthrough)],
+    ['input tokens',    numFmt(s.inputTokensTotal)],
+    ['cache create',    numFmt(s.cacheCreateTokensTotal)],
+    ['cache read',      numFmt(s.cacheReadTokensTotal)],
+    ['cache hit (tok)', hitRateTok],
+    ['cache hit (ev)',  hitRateEv],
+    ['orig chars',      numFmt(s.origCharsTotal)],
+    ['image bytes',     numFmt(s.imageBytesTotal)],
+    ['bytes/char',      charRatio],
+    ['latency p50/p95', numFmt(s.durationP50) + ' / ' + numFmt(s.durationP95) + ' ms'],
+    ['first-byte p50/p95', numFmt(s.firstByteP50) + ' / ' + numFmt(s.firstByteP95) + ' ms'],
+  ];
+  const tbody = document.getElementById('stats_rows');
+  const next = rows.map(([k,v]) =>
+    '<tr><td>' + escapeHtml(k) + '</td><td class="num">' + escapeHtml(String(v)) + '</td></tr>'
+  ).join('');
+  if (tbody.dataset.last !== next) {
+    tbody.innerHTML = next;
+    tbody.dataset.last = next;
+  }
+}
+
+// ---- disk usage panel ----------------------------------------------------
+
+function renderDisk(payload) {
+  const status = document.getElementById('disk_status');
+  if (!payload || payload.error) {
+    status.textContent = payload && payload.error ? payload.error : '(no data)';
+    return;
+  }
+  status.textContent = fmtBytes(payload.totalBytes) + ' on disk';
+  const rows = [
+    ['events.jsonl', fmtBytes(payload.eventsJsonlBytes), payload.paths.eventsFile],
+    ['4xx-bodies/', fmtBytes(payload.sidecarsBytes) + ' (' + payload.sidecarCount + ' files)', payload.paths.sidecarDir],
+  ];
+  const tbody = document.getElementById('disk_rows');
+  const next = rows.map(([k, v, p]) =>
+    '<tr><td>' + escapeHtml(k) + '</td><td class="num">' + escapeHtml(v) + '</td><td class="small" style="color:#6e7681">' + escapeHtml(p) + '</td></tr>'
+  ).join('');
+  if (tbody.dataset.last !== next) {
+    tbody.innerHTML = next;
+    tbody.dataset.last = next;
+  }
+}
+
+// ---- destructive actions: confirm + POST ---------------------------------
+
+async function pruneOlderThan() {
+  const days = parseInt(document.getElementById('prune_days').value, 10);
+  // Dry-run first to compute the impact summary for the confirm prompt.
+  const dryR = await fetch('/api/sessions/prune', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ olderThanDays: days, force: false }),
+  }).then(r => r.json());
+  if (!dryR.sessionsRemoved || dryR.sessionsRemoved.length === 0) {
+    document.getElementById('prune_result').textContent = 'nothing older than ' + days + ' days';
+    return;
+  }
+  const msg = 'Prune ' + dryR.sessionsRemoved.length + ' sessions ('
+    + numFmt(dryR.eventsRemoved) + ' events, '
+    + fmtBytes(dryR.jsonlBytesFreed + dryR.sidecarBytesFreed)
+    + ') older than ' + days + ' days?\\n\\nThis cannot be undone.';
+  if (!window.confirm(msg)) return;
+  const realR = await fetch('/api/sessions/prune', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ olderThanDays: days, force: true }),
+  }).then(r => r.json());
+  document.getElementById('prune_result').textContent =
+    'removed ' + realR.sessionsRemoved.length + ' sessions, '
+    + numFmt(realR.eventsRemoved) + ' events, '
+    + fmtBytes(realR.jsonlBytesFreed + realR.sidecarBytesFreed);
+  tickSlow();
+}
+
+async function deleteSession(id) {
+  const tr = sessRowEls.get(id);
+  let detail = '';
+  if (tr) {
+    const cells = tr.querySelectorAll('td');
+    detail = ' (' + (cells[5] ? cells[5].textContent : '?') + ' events, '
+      + (cells[8] ? cells[8].textContent : '?') + ')';
+  }
+  if (!window.confirm('Delete session ' + id + detail + '?\\n\\nThis cannot be undone.')) return;
+  const r = await fetch('/api/sessions/prune', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId: id, force: true }),
+  }).then(r => r.json());
+  document.getElementById('prune_result').textContent =
+    'removed session ' + id + ' - ' + numFmt(r.eventsRemoved) + ' events, '
+    + fmtBytes(r.jsonlBytesFreed + r.sidecarBytesFreed);
+  tickSlow();
+}
+
+document.getElementById('prune_btn').addEventListener('click', () => {
+  pruneOlderThan().catch(e => {
+    document.getElementById('prune_result').textContent = 'error: ' + e.message;
+  });
+});
+// One delegated listener handles every row's del button. Survives diff renders.
+document.getElementById('sess_rows').addEventListener('click', (ev) => {
+  const t = ev.target;
+  if (t && t.dataset && t.dataset.del) deleteSession(t.dataset.del);
+});
+
+// ---- slow tick (5s) - sessions / stats / disk ----------------------------
+
+async function tickSlow() {
+  try {
+    const [sess, stats, disk] = await Promise.all([
+      fetch('/api/sessions.json').then(r => r.json()).catch(() => null),
+      fetch('/api/stats.json').then(r => r.json()).catch(() => null),
+      fetch('/api/disk.json').then(r => r.json()).catch(() => null),
+    ]);
+    if (sess) renderSessions(sess);
+    if (stats) renderStats(stats);
+    if (disk) renderDisk(disk);
+  } catch (e) {
+    // Slow tick errors are non-fatal - fast tick still updates 'sub'.
+  }
+}
 tick(); setInterval(tick, 2000);
+tickSlow(); setInterval(tickSlow, 5000);
+</script>
+</body></html>
+`;
+
+// ---- session detail HTML template ----------------------------------------
+//
+// Standalone page served at /sessions/${id}. Reuses the same dark theme as
+// the main dashboard for visual continuity. The body content is one panel
+// with the session header + an event table; data is fetched from
+// /api/sessions/${id}.json on load. A checkbox toggles `?include_bodies=1`
+// for privacy-sensitive 4xx body samples.
+
+const SESSION_DETAIL_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pixelpipe - session __SESSION_ID__</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; background: #0d1117; color: #c9d1d9;
+         font: 14px/1.45 -apple-system,BlinkMacSystemFont,"SF Mono",Menlo,monospace; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.01em; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .sub { color: #6e7681; font-size: 12px; margin-bottom: 22px; }
+  .panel { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+           padding: 14px 16px; margin-bottom: 14px; }
+  .meta { display: grid; grid-template-columns: 140px 1fr; gap: 4px 14px;
+          font-size: 12px; }
+  .meta .k { color: #6e7681; }
+  .meta .v { color: #c9d1d9; word-break: break-all; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: #6e7681; font-weight: 500; padding: 6px 8px;
+       border-bottom: 1px solid #30363d; }
+  td { padding: 6px 8px; border-bottom: 1px solid #21262d; vertical-align: top;
+       font-variant-numeric: tabular-nums; }
+  td.num { text-align: right; }
+  tr:last-child td { border-bottom: none; }
+  .json-cell { color: #6e7681; max-width: 600px; overflow: hidden;
+               text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  .json-cell.open { white-space: pre-wrap; word-break: break-all; color: #c9d1d9; }
+  .ctrls { display: flex; gap: 12px; align-items: center; margin: 14px 0; }
+  .ctrls label { font-size: 12px; color: #6e7681; }
+</style>
+</head>
+<body>
+<h1><a href="/">pixelpipe</a> &rarr; session __SESSION_ID__</h1>
+<div class="sub" id="header_sub">loading...</div>
+
+<div class="panel">
+  <div class="meta" id="meta"></div>
+</div>
+
+<div class="ctrls">
+  <label><input type="checkbox" id="include_bodies"> include 4xx body samples (privacy: may contain raw user code)</label>
+  <button type="button" id="del_btn" style="background:#21262d;color:#f85149;border:1px solid #30363d;padding:4px 12px;cursor:pointer;font-size:12px">delete this session</button>
+</div>
+
+<div class="panel">
+  <table>
+    <thead>
+      <tr>
+        <th>#</th><th>ts</th><th>status</th><th>path</th>
+        <th class="num">orig chars</th><th class="num">img bytes</th>
+        <th class="num">cache read</th><th>raw</th>
+      </tr>
+    </thead>
+    <tbody id="ev_rows"></tbody>
+  </table>
+</div>
+
+<script>
+const SESSION_ID = '__SESSION_ID__';
+
+function numFmt(n) {
+  return (Math.round(Number(n) || 0)).toLocaleString();
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  if (n < 1024) return n + ' B';
+  if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+  return (n/(1024*1024)).toFixed(1) + ' MB';
+}
+
+async function load() {
+  const includeBodies = document.getElementById('include_bodies').checked;
+  const url = '/api/sessions/' + encodeURIComponent(SESSION_ID) + '.json'
+    + (includeBodies ? '?include_bodies=1' : '');
+  let payload;
+  try {
+    payload = await fetch(url).then(r => r.json());
+  } catch (e) {
+    document.getElementById('header_sub').textContent = 'fetch error: ' + e.message;
+    return;
+  }
+  if (payload.error) {
+    document.getElementById('header_sub').textContent = payload.error;
+    return;
+  }
+  const evs = payload.events || [];
+  document.getElementById('header_sub').textContent =
+    evs.length + ' events  -  ' + (includeBodies ? 'body samples shown' : 'body samples redacted');
+
+  const meta = document.getElementById('meta');
+  const cc = payload.claudeCode;
+  const first = evs[0] || {};
+  const last = evs[evs.length-1] || {};
+  const metaRows = [
+    ['session', SESSION_ID],
+    ['events', evs.length],
+    ['project (cwd)', first.cwd || '-'],
+    ['first seen', first.ts || '-'],
+    ['last seen', last.ts || '-'],
+  ];
+  if (cc) {
+    metaRows.push(['claude code session', cc.sessionId]);
+    metaRows.push(['claude code project', cc.projectPath]);
+    metaRows.push(['first user preview', cc.firstUserPreview]);
+  } else {
+    metaRows.push(['claude code', 'no matching ~/.claude/projects/ session']);
+  }
+  meta.innerHTML = metaRows.map(([k, v]) =>
+    '<div class="k">' + escapeHtml(String(k)) + '</div><div class="v">' + escapeHtml(String(v)) + '</div>'
+  ).join('');
+
+  const tbody = document.getElementById('ev_rows');
+  tbody.innerHTML = evs.map((e, i) => {
+    const cls = e.status >= 500 ? 'bad' : e.status >= 400 ? 'warn' : '';
+    const raw = escapeHtml(JSON.stringify(e));
+    return '<tr>'
+      + '<td>' + (i+1) + '</td>'
+      + '<td class="small">' + escapeHtml(String(e.ts || '')) + '</td>'
+      + '<td class="' + cls + '">' + escapeHtml(String(e.status || '')) + '</td>'
+      + '<td>' + escapeHtml(String(e.path || '')) + '</td>'
+      + '<td class="num">' + numFmt(e.orig_chars) + '</td>'
+      + '<td class="num">' + numFmt(e.image_bytes) + '</td>'
+      + '<td class="num">' + numFmt(e.cache_read_tokens) + '</td>'
+      + '<td><div class="json-cell" onclick="this.classList.toggle(\\'open\\')">' + raw + '</div></td>'
+      + '</tr>';
+  }).join('');
+}
+
+document.getElementById('include_bodies').addEventListener('change', load);
+document.getElementById('del_btn').addEventListener('click', async () => {
+  if (!window.confirm('Delete session ' + SESSION_ID + ' and all its events?\\n\\nThis cannot be undone.')) return;
+  const r = await fetch('/api/sessions/prune', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId: SESSION_ID, force: true }),
+  }).then(r => r.json());
+  alert('removed ' + numFmt(r.eventsRemoved) + ' events, ' + fmtBytes(r.jsonlBytesFreed + r.sidecarBytesFreed));
+  window.location.href = '/';
+});
+load();
 </script>
 </body></html>
 `;
