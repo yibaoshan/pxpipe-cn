@@ -154,7 +154,7 @@ describe('renderer', () => {
   });
 
   it('multi-col halves image count on row-heavy input', async () => {
-    // ~500 lines of narrow content. Single-col packs 141 lines/image →
+    // ~500 lines of narrow content. Single-col packs 195 lines/image →
     // ~4 images. Two columns should drop that to ~2.
     const text = ('lorem ipsum dolor sit amet\n'.repeat(500));
     const single = await renderTextToPngs(text, 100);
@@ -299,7 +299,7 @@ describe('renderer', () => {
     }
   });
 
-  // ---- Unicode coverage tests (Unifont atlas) -------------------------------
+  // ---- Unicode coverage tests (hybrid atlas fallback) -------------------------------
   // These confirm the sparse-codepoint + wide-glyph machinery works end-to-end.
   // None of them assert specific PNG bytes (the byte-deterministic guarantee
   // is covered by the 'renders identical input...' test below); they assert
@@ -1739,11 +1739,11 @@ describe('transform', () => {
 
   // --- Per-block break-even gate (URGENT slice, supersedes prior threshold tests) ---
   // history-researcher's round-3 analysis measured Anthropic's real per-image
-  // cost at ~2,500 tokens. At the current renderer config (14,100 chars/image)
+  // cost at ~2,500 tokens. At the current renderer config (19,500 chars/image)
   // the break-even point is 10,000 chars per image. Blocks shorter than that
   // cost MORE as images than as text. The fix: gate every per-block image
   // encoding on `isCompressionProfitable()` which checks
-  //   ceil(textLen / 14100) * 2500 < textLen / 4
+  //   ceil(textLen / 19500) * 2500 < textLen / 4
   // Tests below confirm the function math AND that the gates correctly skip
   // net-loss compressions in the full pipeline.
 
@@ -1897,10 +1897,10 @@ describe('transform', () => {
     expect(out.info.imageCount ?? 0).toBeGreaterThan(0);
   });
 
-  it('isCompressionProfitable: slab cpt=2.5 flips a 161k production-shape slab profitable at multi-col=2', () => {
-    // Pin the math directly. Image cost at multi-col=2: 8 imgs × 5500 =
-    // 44,000 tok. At cpt=4, text=40,275 → REJECT. At cpt=2.5, text=64,440
-    // → ACCEPT with 20k headroom over the conservative slab cpt.
+  it('isCompressionProfitable: 5x8 atlas makes a 161k production-shape slab profitable even at cpt=4', () => {
+    // Pin the math directly. The 5×8 atlas drops this shape to ~6 two-column
+    // images: 6 × 5500 = 33,000 image tokens. At cpt=4, text≈40,275, so
+    // it now ACCEPTS even under a conservative prose/token override.
     const parts: string[] = [];
     let acc = 0;
     while (acc < 161_101) {
@@ -1909,26 +1909,26 @@ describe('transform', () => {
       acc += len + 1;
     }
     const slab = parts.join('\n').slice(0, 161_101);
-    expect(isCompressionProfitable(slab, 100, undefined, 2, 4)).toBe(false);
+    expect(isCompressionProfitable(slab, 100, undefined, 2, 4)).toBe(true);
     expect(isCompressionProfitable(slab, 100, undefined, 2, 2.5)).toBe(true);
   });
 
   it('TransformOptions.charsPerToken: explicit 4 is honored (no silent swap to SLAB_CHARS_PER_TOKEN)', async () => {
     // Fragility #2 regression: the override-gate previously used a `!==
-    // CHARS_PER_TOKEN` check that silently swapped 4 → 2.5 because the static
-    // default *also* happens to be 4. After the fix it uses `!== undefined`,
-    // so passing exactly 4 is honored as an explicit override.
+    // CHARS_PER_TOKEN` check that silently swapped 4 → the built-in slab cpt
+    // because the static default *also* happened to be 4. After the fix it
+    // uses `!== undefined`, so passing exactly 4 is honored as an explicit
+    // host override.
     //
-    // Observable proof: the 161k production-shape slab is REJECTED at cpt=4
-    // (text=40,275 tok < image=44,000 tok) and ACCEPTED at the built-in
-    // SLAB_CHARS_PER_TOKEN=2.5 (text=64,440 tok). If the collision bypass
-    // breaks, the slab will compress under an explicit `4` — which would
-    // mean the host can't ever pin to the conservative English-prose value.
+    // Observable proof after the 5×8 atlas: a row-heavier 50k slab is
+    // REJECTED at cpt=4 but ACCEPTED at the built-in Opus-4.7 cpt=2. If the
+    // collision bypass breaks, the slab will compress under explicit `4` —
+    // meaning the host cannot pin to conservative English-prose density.
     const parts: string[] = [];
     let acc = 0;
-    const target = 161_101;
+    const target = 50_000;
     while (acc < target) {
-      const len = 60 + (acc % 40);
+      const len = 50;
       parts.push('A'.repeat(len) + (acc % 200 === 0 ? '   ' : ''));
       acc += len + 1;
     }
@@ -1940,40 +1940,40 @@ describe('transform', () => {
     });
     const bytes = new TextEncoder().encode(req);
 
-    // Built-in cpt (no override): slab compresses via SLAB_CHARS_PER_TOKEN=2.5.
+    // Built-in cpt (no override): slab compresses via SLAB_CHARS_PER_TOKEN=2.0.
     const builtin = await transformRequest(bytes, { multiCol: 2 });
     expect(builtin.info.compressed).toBe(true);
 
     // Explicit cpt=4: host pinned to the English-prose value. The slab gate
-    // must honor it and reject the slab — not silently fall back to 2.5.
+    // must honor it and reject the slab — not silently fall back to 2.0.
     const overridden = await transformRequest(bytes, { multiCol: 2, charsPerToken: 4 });
     expect(overridden.info.compressed).toBe(false);
     expect(overridden.info.reason).toMatch(/^not_profitable/);
   });
 
   // --- Adaptive break-even: CHARS_PER_IMAGE derived from atlas cell, not hardcoded ---
-  // Brief: when font-rater swaps to a smaller cell (e.g. Cozette 4×7), more chars
-  // pack into one image, so the N-image break-even thresholds shift. Tests below
-  // verify both the regression case (current Unifont 5×11) AND that the formula
+  // Brief: when font-rater swaps the atlas cell height, more/fewer chars pack
+  // into one image, so the N-image break-even thresholds shift. Tests below
+  // verify both the regression case (current Spleen/Unifont 5×8 hybrid) AND that the formula
   // responds to `cols` (which scales chars/image linearly the same way a smaller
   // cell-H would).
 
-  it('maxCharsPerImage: matches the historic 14,100 constant at the shipping config', () => {
-    // Unifont 5×11, cols=100 → floor((1568−8)/11) × 100 = 141 × 100 = 14,100.
+  it('maxCharsPerImage: matches the 19,500 constant at the 5x8 shipping config', () => {
+    // Spleen/Unifont 5×8, cols=100 → floor((1568−8)/8) × 100 = 195 × 100 = 19,500.
     // If this ever drifts, every break-even test downstream needs re-pinning.
-    expect(maxCharsPerImage(100)).toBe(14_100);
+    expect(maxCharsPerImage(100)).toBe(19_500);
   });
 
   it('maxCharsPerImage: scales linearly with cols (same atlas)', () => {
-    expect(maxCharsPerImage(50)).toBe(7_050);
-    expect(maxCharsPerImage(200)).toBe(28_200);
+    expect(maxCharsPerImage(50)).toBe(9_750);
+    expect(maxCharsPerImage(200)).toBe(39_000);
   });
 
   it('isCompressionProfitable: doubling cols halves the 2-image break-even threshold', () => {
-    // At cols=100, CHARS_PER_IMAGE=14,100. 20,000 chars needs 2 images (cost
+    // At cols=100, CHARS_PER_IMAGE=19,500. 20,000 chars needs 2 images (cost
     // 5000 tokens) vs 5000 text-tokens → tied, strict `<` returns false.
     expect(isCompressionProfitable(20_000, 100)).toBe(false);
-    // At cols=200, CHARS_PER_IMAGE=28,200. 20,000 chars fits in 1 image
+    // At cols=200, CHARS_PER_IMAGE=39,000. 20,000 chars fits in 1 image
     // (cost 2500 tokens) vs 5000 text-tokens → clear win.
     expect(isCompressionProfitable(20_000, 200)).toBe(true);
   });
@@ -1989,21 +1989,21 @@ describe('transform', () => {
   it('isCompressionProfitable(string): row-aware → newline-heavy sparse content (~5500 chars/img) rejected as net-loss', () => {
     // Regression for the -69% dashboard bug: the number-arg form estimates
     // by chars/charsPerImage which assumes uniform line-fill. That assumes
-    // 14100 chars/image but renderTextToPngs actually packs ~141 visual
+    // 19500 chars/image but renderTextToPngs actually packs ~195 visual
     // rows/image — newline-heavy code/logs hit row cap WAY before char cap.
     //
-    // 50000 chars of `x.md\n` is 5000 short lines → 5000 rows / 141 = 36
-    // images. 36 * 2500 = 90000 image tokens vs 50000/4 = 12500 text tokens.
+    // 50000 chars of `x.md\n` is 5000 short lines → 5000 rows / 195 = 26
+    // images. 26 * 2500 = 65000 image tokens vs 50000/4 = 12500 text tokens.
     // Massive net loss. Number-arg form would incorrectly accept (50000 chars
-    // / 14100 chars-per-img = 4 imgs → 10000 < 12500 → "profitable").
+    // / 19500 chars-per-img = 3 imgs → 7500 < 12500 → "profitable").
     const sparse = 'x.md\n'.repeat(10_000);
     expect(isCompressionProfitable(sparse, 100)).toBe(false);
     expect(isCompressionProfitable(sparse.length, 100)).toBe(true); // back-compat: looser estimate
   });
 
   it('isCompressionProfitable(string): row-aware → dense single-line content packs full-width and profits', () => {
-    // Same 50000 chars but as ONE line wraps to 100-char rows → 500 rows / 141
-    // = 4 images. 4 * 2500 = 10000 image tokens vs 50000/4 = 12500 text →
+    // Same 50000 chars but as ONE line wraps to 100-char rows → 500 rows / 195
+    // = 3 images. 3 * 2500 = 7500 image tokens vs 50000/4 = 12500 text →
     // profitable. Both forms agree on dense content.
     const dense = 'x'.repeat(50_000);
     expect(isCompressionProfitable(dense, 100)).toBe(true);
@@ -2013,7 +2013,7 @@ describe('transform', () => {
   it('isCompressionProfitable(string, cols, cap): truncation cap lets 500KB log become profitable', () => {
     // For tool_result paging — actual image cost is bounded by maxImagesPerToolResult
     // while the SAVED text is the full pre-truncation length. Without cap we'd
-    // reject (50k rows = 355 images), with cap=10 we accept (10*2500=25000 vs
+    // reject (50k rows = 257 images), with cap=10 we accept (10*2500=25000 vs
     // 500000/4=125000 text → win by 100k).
     const lines: string[] = [];
     for (let i = 0; i < 10_000; i++) lines.push(`log entry ${i} payload`);
@@ -2022,16 +2022,11 @@ describe('transform', () => {
     expect(isCompressionProfitable(log, 100, 10)).toBe(true); // capped, profits
   });
 
-  it('isCompressionProfitable: smaller-cell atlas (Cozette-shape) would let 16k blocks become 1-image wins (cols proxy)', () => {
-    // True smaller-cell test would need to mock ATLAS_CELL_H. We use cols as
-    // a proxy since CHARS_PER_IMAGE = cols × floor((1568−8)/cell_H) — doubling
-    // cols at fixed cell_H is mathematically the same as halving cell_H at
-    // fixed cols. A Cozette 4×7 cell at cols=100 yields floor(1560/7)×100 =
-    // 22,200 chars/image, ~57% more than today. Equivalent: cols=157 at the
-    // current cell. A 16,000-char block needs 2 images today (2-image break-
-    // even fails); at the equivalent Cozette-shape config it fits in 1.
-    expect(isCompressionProfitable(16_000, 100)).toBe(false); // 2 imgs @ 5000 vs 4000 text
-    expect(isCompressionProfitable(16_000, 157)).toBe(true); // 1 img @ 2500 vs 4000 text
+  it('isCompressionProfitable: 5x8 atlas lets 16k blocks become 1-image wins', () => {
+    // The old Unifont 5×11 atlas packed 14,100 chars/image, so 16k chars
+    // needed 2 images and failed break-even. The 5×8 hybrid atlas packs
+    // 19,500 chars/image, so the same block fits in one image and wins.
+    expect(isCompressionProfitable(16_000, 100)).toBe(true);
   });
 
   it('break-even gate: 7000-char tool_result stays as text (below break-even)', async () => {
@@ -2342,20 +2337,20 @@ describe('transform', () => {
   describe('real-shape regression (anonymized production events.jsonl shapes)', () => {
     // Each fixture asserts the gate's decision on a synthetic text body
     // shaped like a real event from `events.jsonl` (2026-05-19 → 2026-05-20).
-    // The constants `SLAB_CHARS_PER_TOKEN = 2.5` and `HISTORY_CHARS_PER_TOKEN = 2.5`
-    // are empirical fits to N=354 production samples. If a future model
+    // The constants `SLAB_CHARS_PER_TOKEN = 2.0` and `HISTORY_CHARS_PER_TOKEN = 2.0`
+    // are empirical fits to Opus 4.7 production samples. If a future model
     // (Sonnet 4.6 vs Opus 4.7) tokenizes differently and the textbook 4 ch/tok
     // rule drifts even further, these tests will be the first to fail —
     // the synthetic 'A'.repeat(N) shapes elsewhere prove the math but not
     // the *constants*. Refresh the shape constants from a fresh events.jsonl
     // when that happens; see tests/fixtures/real-shapes.ts.
 
-    it('production slab (161k chars, multi-col): ACCEPTED at slab cpt=2.5', () => {
+    it('production slab (161k chars, multi-col): ACCEPTED at slab cpt=2.0', () => {
       const shape = PRODUCTION_SLAB_161K;
       const text = synthesizeText(shape);
-      // The body that motivated e8545a9. Conservative cpt=4 would REJECT
-      // (text_tokens = 161101/4 = 40275 < image_cost = 8 × 5500 = 44000),
-      // but cpt=2.5 lifts text_tokens to 64440 → ACCEPT with ~20k headroom.
+      // The body that motivated the cpt calibration. Conservative cpt=4 would
+      // reject many dense slabs under the older geometry; cpt=2.0 reflects
+      // Opus 4.7 telemetry and keeps this shape accepted with margin.
       expect(
         isCompressionProfitable(text, 100, undefined, shape.numCols, SLAB_CHARS_PER_TOKEN),
       ).toBe(true);
@@ -2363,13 +2358,13 @@ describe('transform', () => {
       expect(isCompressionProfitable(text, 100, undefined, shape.numCols)).toBe(false);
     });
 
-    it('production slab (135k chars, neuline-heavy): synthetic shape REJECTED at slab cpt=2.5', () => {
+    it('production slab (135k chars, newline-heavy): synthetic shape REJECTED at slab cpt=2.0', () => {
       const shape = PRODUCTION_SLAB_135K_DENSE;
       const text = synthesizeText(shape);
       // Note: the real production event for this shape was ACCEPTED (compressed),
       // but uniform `'A'.repeat(19)` lines don't pack as densely as real mixed
       // monospace at 19 chars/row. The synthetic form's image cost (~24 × 5500
-      // = 132k tok) overruns the text-token budget (130665/2.5 = 52k). The
+      // = 132k tok) overruns the text-token budget (130665/2.0 = 65k). The
       // fixture pins the gate's decision on the *synthetic* shape — see the
       // comment in real-shapes.ts for why this divergence is expected.
       expect(
@@ -2377,11 +2372,11 @@ describe('transform', () => {
       ).toBe(false);
     });
 
-    it('production slab (169k chars, very dense): REJECTED even at slab cpt=2.5', () => {
+    it('production slab (169k chars, very dense): REJECTED even at slab cpt=2.0', () => {
       const shape = PRODUCTION_SLAB_169K_HEAVY;
       const text = synthesizeText(shape);
-      // The largest real-event shape we logged. Even at cpt=2.5 the body
-      // (169632/2.5 = 67852 tok) doesn't clear the image cost (37 imgs × 5500
+      // The largest real-event shape we logged. Even at cpt=2.0 the body
+      // (169632/2.0 = 84816 tok) doesn't clear the image cost (37 imgs × 5500
       // × 2 = 407k tok at multiCol=2). Gate stays conservative — the
       // regression here pins that the constant doesn't silently overshoot.
       expect(

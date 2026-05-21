@@ -280,14 +280,13 @@ function effectiveTokensPerImage(numCols: number): number {
  *
  *  Formula: `cols × floor((MAX_HEIGHT_PX − 2·PAD_Y) / ATLAS_CELL_H)`
  *
- *  At the shipping config (Unifont, cell 5×11, cols=100):
- *    100 × floor((1568 − 8) / 11) = 100 × 141 = 14,100
+ *  At the shipping config (Spleen/Unifont hybrid, cell 5×8, cols=100):
+ *    100 × floor((1568 − 8) / 8) = 100 × 195 = 19,500
  *
- *  When the atlas swaps (e.g. Cozette 4×7, cell H=7), this auto-updates:
- *    100 × floor(1560 / 7) = 100 × 222 = 22,200
- *  …and the break-even threshold drops accordingly. Without this, the
- *  hardcoded 14,100 would silently let net-loss compressions through on
- *  every smaller-cell atlas. */
+ *  When the atlas swaps again, this auto-updates and the break-even
+ *  threshold moves with the actual renderer geometry. Without this, a
+ *  stale hardcoded chars/image constant would silently mis-price image
+ *  compressions. */
 /** Visual rows per image at the current atlas cell. Derived once at module
  *  load. Auto-updates when gen-atlas regenerates with a different font/size. */
 export const LINES_PER_IMAGE = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / ATLAS_CELL_H));

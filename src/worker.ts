@@ -50,7 +50,7 @@ export default {
       compressToolResults: truthy(env.COMPRESS_TOOL_RESULTS, true),
       minCompressChars: env.MIN_COMPRESS_CHARS ? Number(env.MIN_COMPRESS_CHARS) : 2000,
       // Raised to 10,000 — per-block break-even point at current renderer
-      // config (Unifont 10px, cell 5×11, 100 cols). Real gate is
+      // config (Spleen/Unifont 5×8 hybrid, 100 cols). Real gate is
       // `isCompressionProfitable()` in transform.ts; this is a fast-path
       // skip for obvious-no cases. Keep in sync with DEFAULTS.
       minReminderChars: env.MIN_REMINDER_CHARS ? Number(env.MIN_REMINDER_CHARS) : 10000,

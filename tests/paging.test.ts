@@ -25,11 +25,11 @@ import {
 import { toTrackEvent } from '../src/core/tracker.js';
 import type { ProxyEvent } from '../src/core/proxy.js';
 
-// Default render config: cols=100, ~141 lines/img → ~14,100 chars/img if
+// Default render config: cols=100, 195 lines/img → ~19,500 chars/img if
 // lines fully fill the width. For shorter lines, the budget is dominated
 // by row count (each line takes ≥1 row regardless of length).
 const COLS = 100;
-const ROWS_PER_IMG = 141; // floor((1568 - 8) / 11)
+const ROWS_PER_IMG = 195; // floor((1568 - 8) / 8), Spleen 5×8 hybrid atlas
 
 describe('estimateImageCount', () => {
   it('returns 1 for empty / tiny text', () => {
@@ -38,14 +38,14 @@ describe('estimateImageCount', () => {
   });
 
   it('scales linearly with row count for short-line content', () => {
-    // 141 lines of "x" (1 char) = 141 rows = 1 image.
-    const oneImage = Array.from({ length: 141 }, () => 'x').join('\n');
+    // 195 lines of "x" (1 char) = 195 rows = 1 image.
+    const oneImage = Array.from({ length: ROWS_PER_IMG }, () => 'x').join('\n');
     expect(estimateImageCount(oneImage, COLS)).toBe(1);
-    // 142 lines = 2 images (just over the line).
-    const justOver = Array.from({ length: 142 }, () => 'x').join('\n');
+    // 196 lines = 2 images (just over the line).
+    const justOver = Array.from({ length: ROWS_PER_IMG + 1 }, () => 'x').join('\n');
     expect(estimateImageCount(justOver, COLS)).toBe(2);
-    // 10 × 141 = 1410 lines → 10 images.
-    const tenImages = Array.from({ length: 1410 }, () => 'x').join('\n');
+    // 10 × 195 = 1950 lines → 10 images.
+    const tenImages = Array.from({ length: ROWS_PER_IMG * 10 }, () => 'x').join('\n');
     expect(estimateImageCount(tenImages, COLS)).toBe(10);
   });
 
@@ -53,18 +53,18 @@ describe('estimateImageCount', () => {
     // A single 1000-char line wraps to ceil(1000/100) = 10 rows.
     const wrapped = 'x'.repeat(1000);
     expect(estimateImageCount(wrapped, COLS)).toBe(1); // 10 rows, fits in 1 img
-    // 14,100 chars on one line → 141 rows → 1 image.
-    const oneImg = 'x'.repeat(14_100);
+    // 19,500 chars on one line → 195 rows → 1 image.
+    const oneImg = 'x'.repeat(19_500);
     expect(estimateImageCount(oneImg, COLS)).toBe(1);
-    // 14,101 chars → 142 rows → 2 images.
-    const twoImgs = 'x'.repeat(14_101);
+    // 19,501 chars → 196 rows → 2 images.
+    const twoImgs = 'x'.repeat(19_501);
     expect(estimateImageCount(twoImgs, COLS)).toBe(2);
   });
 
   it('also accepts a numeric length (legacy chars-based estimate)', () => {
     expect(estimateImageCount(0, COLS)).toBe(1);
-    expect(estimateImageCount(14_100, COLS)).toBe(1);
-    expect(estimateImageCount(14_101, COLS)).toBe(2);
+    expect(estimateImageCount(19_500, COLS)).toBe(1);
+    expect(estimateImageCount(19_501, COLS)).toBe(2);
   });
 });
 
@@ -152,7 +152,7 @@ describe('truncateForBudget', () => {
 
   it('truncates head+tail for log-shaped content over the budget', () => {
     // 10k log lines, each ~32 chars → ~320k chars total. With short lines
-    // the row budget dominates: 10k rows >> 10 × 141 = 1410 row budget.
+    // the row budget dominates: 10k rows >> 10 × 195 = 1950 row budget.
     const lines: string[] = [];
     for (let i = 0; i < 10_000; i++) {
       lines.push(`2026-05-18T12:00:${String(i % 60).padStart(2, '0')}Z entry ${i}`);
@@ -361,9 +361,9 @@ describe('paging end-to-end (transformRequest)', () => {
     expect(info.truncatedToolResults).toBe(2);
     // Both should have been truncated → omittedChars roughly doubled. The
     // exact bound depends on renderer config: at multiCol=1 each image
-    // packs ~14k chars worst-case, multiCol=2 packs ~28k → less omitted
+    // packs ~19.5k chars worst-case, multiCol=2 packs ~39k → less omitted
     // at the same maxImagesPerToolResult cap. Threshold below covers both.
-    expect(info.omittedChars).toBeGreaterThan(700_000);
+    expect(info.omittedChars).toBeGreaterThan(600_000);
   });
 
   it('handles array-shaped tool_result content', async () => {

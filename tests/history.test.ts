@@ -448,29 +448,24 @@ describe('transformRequest history compression (always-on)', () => {
     expect(info.historyReason).toBe('no_closed_prefix');
   });
 
-  it('borderline fixture: collapses with built-in HISTORY_CHARS_PER_TOKEN=2.5 where cpt=4 would reject', async () => {
+  it('borderline fixture: collapses with built-in HISTORY_CHARS_PER_TOKEN=2.0 where cpt=4 would reject', async () => {
     // Empirical 2026-05-20: N=10 production "history rejected as
     // not_profitable" events have body cpt 1.08-1.10. The gate using
     // cpt=4 was estimating text as 3.7× cheaper than reality and
     // rejecting compressions that real billing would have approved.
     //
-    // This fixture pins the wiring of HISTORY_CHARS_PER_TOKEN=2.5 into the
-    // transformRequest → collapseHistory gate. It sits in the band where
-    // image cost (5000 tok ≈ 2 images) is:
-    //   • > text-tokens at cpt=4   → REJECT under stale default
-    //   • < text-tokens at cpt=2.5 → ACCEPT under the empirical fix
-    //
-    // 10 collapsed turns × 1500 chars/turn ≈ 15-17k chars after framing.
-    // Single-col packs ≈ 14k chars/image → 2 images. At cpt=4: text=4k tok
-    // vs image=5k tok → reject. At cpt=2.5: text=6.4k tok > image=5k tok
-    // → accept with ≈1.4k tok headroom.
+    // This fixture pins the wiring of HISTORY_CHARS_PER_TOKEN=2.0 into the
+    // transformRequest → collapseHistory gate after the 5×8 atlas change.
+    // It sits in the band where image cost is:
+    //   • > text-tokens at cpt=4   → REJECT under stale/default prose cpt
+    //   • < text-tokens at cpt=2.0 → ACCEPT under Opus 4.7 telemetry
     const msgs: Message[] = [];
     for (let i = 0; i < 14; i++) {
-      const body = `turn ${i}: ` + bigPlain(1500);
+      const body = `turn ${i}: ` + bigPlain(900);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
     const { info } = await transformRequest(mkBody(msgs, bigPlain(80_000)));
-    // Under HISTORY_CHARS_PER_TOKEN=2.5 this fixture collapses cleanly.
+    // Under HISTORY_CHARS_PER_TOKEN=2.0 this fixture collapses cleanly.
     expect(info.historyReason).toBe('collapsed');
     expect(info.collapsedTurns).toBe(10);
 
@@ -496,13 +491,13 @@ describe('transformRequest history compression (always-on)', () => {
     // gate now uses `!== undefined` so a literal 4 stays a literal 4.
     //
     // Observable proof: a borderline-density fixture (1200-char bodies × 14
-    // turns) that is rejected at cpt=4 but accepted at cpt=2.5. If the gate
-    // silently swapped explicit 4 → 2.5, this fixture would collapse — but
+    // turns) that is rejected at cpt=4 but accepted at cpt=2.0. If the gate
+    // silently ignored explicit 4, this fixture would collapse — but
     // with the fix it stays rejected, confirming the gate honored the literal
-    // 4. The companion test below pins cpt=2.5 collapse on the same shape.
+    // 4. The companion test below pins cpt=2.0 collapse on the same shape.
     const msgs: Message[] = [];
     for (let i = 0; i < 14; i++) {
-      const body = `turn ${i}: ` + bigPlain(1200);
+      const body = `turn ${i}: ` + bigPlain(900);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
     const explicit4 = await transformRequest(mkBody(msgs, bigPlain(80_000)), {
@@ -511,13 +506,13 @@ describe('transformRequest history compression (always-on)', () => {
     expect(explicit4.info.historyReason).toBe('not_profitable');
     expect(explicit4.info.collapsedTurns).toBeUndefined();
 
-    // Same shape at cpt=2.5 collapses — proves the fixture actually straddles
+    // Same shape at cpt=2.0 collapses — proves the fixture actually straddles
     // the threshold and isn't a tautology.
-    const explicit25 = await transformRequest(mkBody(msgs, bigPlain(80_000)), {
-      charsPerToken: 2.5,
+    const explicit20 = await transformRequest(mkBody(msgs, bigPlain(80_000)), {
+      charsPerToken: 2.0,
     });
-    expect(explicit25.info.historyReason).toBe('collapsed');
-    expect(explicit25.info.collapsedTurns).toBe(10);
+    expect(explicit20.info.historyReason).toBe('collapsed');
+    expect(explicit20.info.collapsedTurns).toBe(10);
   });
 
   it('history-image blocks carry NO cache_control (conservative first-cut)', async () => {

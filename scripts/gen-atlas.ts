@@ -1,34 +1,23 @@
 /**
- * Build-time glyph atlas generator — Unicode-capable variant.
+ * Build-time glyph atlas generator — Unicode-capable hybrid code-font atlas.
  *
- * Reads assets/Unifont-16.0.04.otf, rasterizes a configurable subset of
- * Unicode BMP into a sparse-indexed grayscale atlas, and emits
- * src/core/atlas.ts with binary-packed lookup tables inlined as base64.
+ * Default atlas (2026-05): Spleen 5×8 for printable ASCII/code glyphs,
+ * Unifont 16.0.04 at 8px for Unicode fallback (CJK, arrows, symbols,
+ * math, Hangul, etc.). The runtime renderer still sees one sparse atlas:
+ * codepoint → bit offset + wide flag. There is no runtime font dependency.
  *
- * Why Unifont:
- * - Single font covers ~57k BMP codepoints (Latin + Cyrillic + CJK + Hira +
- *   Kata + Greek + Hebrew + Arabic + box-drawing + math symbols + …).
- * - Pixel-perfect at 10px (it's a bitmap font designed for that grid).
- * - East Asian Width property respected by @napi-rs/canvas — CJK measures as
- *   2× Latin width. The renderer assumes this; gen-atlas asserts it.
- * - License: OFL + GPL-with-font-exception. Ship-friendly.
- *
- * Why sparse:
- * - The contiguous-range approach (FIRST..LAST) doesn't work when we want
- *   widely-separated blocks (e.g. ASCII + Cyrillic + CJK). A sparse codepoint
- *   list + binary search at render time is the natural shape.
+ * Why hybrid instead of replacing Unifont outright:
+ * - Spleen 5×8 is a real bitmap/code font and is materially denser than
+ *   Unifont 10px: 5×8 cells vs 5×11, ~38% more rows per 1568px image.
+ * - Spleen intentionally targets small code/terminal glyphs, but does not
+ *   cover CJK/symbol blocks. Unifont remains the broad fallback so existing
+ *   dropped-glyph behavior does not regress for non-ASCII text.
+ * - The generator bakes both into one 1-bit atlas, preserving the Workers-safe
+ *   zero-runtime-dependency contract.
  *
  * Profiles (selected via ATLAS_PROFILE env, default 'full-bmp'):
- * - 'full-bmp'  (~35k codepoints): everything Unifont covers in BMP,
- *    including Hangul. Default. Bundle exceeds the Cloudflare Workers
- *    free-tier 1 MB compressed-bundle cap; suitable for Node and paid
- *    Workers tier deployments.
- * - 'practical' (~24k codepoints): drops Hangul Syllables to fit Workers
- *    free-tier. Use via `ATLAS_PROFILE=practical pnpm run build:atlas`
- *    when deploying under the 1 MB compressed-bundle cap.
- *
- * Runs only at build time. Has zero runtime deps — the generated atlas.ts
- * works identically in Node and Cloudflare Workers.
+ * - 'full-bmp'  (~35k codepoints): practical Unicode blocks + Hangul.
+ * - 'practical' (~24k codepoints): drops Hangul Syllables for smaller bundles.
  */
 
 import { GlobalFonts, createCanvas } from '@napi-rs/canvas';
@@ -36,19 +25,18 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const ROOT = resolve(import.meta.dirname, '..');
-const OTF_PATH = resolve(ROOT, 'assets/Unifont-16.0.04.otf');
+const PRIMARY_FONT_PATH = resolve(ROOT, 'assets/Spleen-5x8.otb');
+const FALLBACK_FONT_PATH = resolve(ROOT, 'assets/Unifont-16.0.04.otf');
 const OUT_PATH = resolve(ROOT, 'src/core/atlas.ts');
 
-const FONT_FAMILY = 'Unifont';
-const FONT_PX = Number(process.env.FONT_PX ?? 10);
-// Default to `full-bmp` so Korean / decorative blocks / math symbols all
-// ship by default. `ATLAS_PROFILE=practical` is the Workers-free-tier
-// escape hatch for deployments under the 1 MB compressed-bundle cap.
+const PRIMARY_FONT_FAMILY = 'Spleen';
+const FALLBACK_FONT_FAMILY = 'Unifont';
+const PRIMARY_FONT_PX = 8;
+const FALLBACK_FONT_PX = 8;
+const FONT_FAMILY_LABEL = 'Spleen 5x8 ASCII + Unifont 8px fallback';
 const PROFILE = (process.env.ATLAS_PROFILE ?? 'full-bmp') as 'practical' | 'full-bmp';
 
-/** Codepoint blocks included in each profile. The order doesn't affect
- *  correctness (we sort by codepoint before emitting); it's just a
- *  readable build log. */
+/** Codepoint blocks included in each profile. */
 const PRACTICAL_RANGES: ReadonlyArray<readonly [number, number, string]> = [
   [0x0020, 0x007e, 'ASCII printable'],
   [0x00a0, 0x024f, 'Latin-1 Supp + Latin Extended-A + Latin Extended-B'],
@@ -57,9 +45,6 @@ const PRACTICAL_RANGES: ReadonlyArray<readonly [number, number, string]> = [
   [0x0590, 0x05ff, 'Hebrew'],
   [0x0600, 0x06ff, 'Arabic'],
   [0x2000, 0x206f, 'General Punctuation'],
-  // Added based on production drop histogram (#27 + #28): 95% of live drops
-  // fall in these seven blocks — mostly decorative symbols, math notation,
-  // and info bullets Claude Code's tool output uses heavily (✓ ✗ ⚠ ℝ ℕ ℤ ⓘ).
   [0x2100, 0x214f, 'Letterlike Symbols'],
   [0x2190, 0x21ff, 'Arrows'],
   [0x2200, 0x22ff, 'Mathematical Operators'],
@@ -83,176 +68,173 @@ const HANGUL: ReadonlyArray<readonly [number, number, string]> = [
 
 const RANGES = PROFILE === 'full-bmp' ? [...PRACTICAL_RANGES, ...HANGUL] : PRACTICAL_RANGES;
 
-// --- Register the font -----------------------------------------------------
-const otfBytes = readFileSync(OTF_PATH);
-GlobalFonts.register(otfBytes, FONT_FAMILY);
+// --- Register fonts --------------------------------------------------------
+GlobalFonts.register(readFileSync(PRIMARY_FONT_PATH), PRIMARY_FONT_FAMILY);
+GlobalFonts.register(readFileSync(FALLBACK_FONT_PATH), FALLBACK_FONT_FAMILY);
 
-// --- Probe cell dimensions -------------------------------------------------
-// Use a measurement canvas large enough to hold a wide glyph + descenders.
+// Spleen 5x8 defines the global Latin cell. Unifont fallback at 8px is
+// narrower (4px Latin / 8px CJK) and is painted into the same 5/10px cells,
+// leaving a little right-side blank space rather than changing renderer math.
 const probe = createCanvas(64, 64);
 const pctx = probe.getContext('2d');
-pctx.font = `${FONT_PX}px ${FONT_FAMILY}`;
 pctx.textBaseline = 'alphabetic';
-
-// --- cell dimensions: derive from probe data, not hardcoded ---------------
-//
-// Latin advance ('M') and CJK advance ('中') give the visual cell widths.
-// East Asian Width = Wide requires CJK = 2 × Latin EXACTLY — verified on the
-// UNROUNDED floats (Unifont at 11px reports Latin=5.5, CJK=11.0; that's a
-// clean 2× ratio that integer rounding would falsely reject as 6 ≠ 11). Use
-// Math.ceil for the cell width so half-pixel sizes round UP and CJK glyphs
-// don't clip on the right edge.
-//
-// Cell height: probe a representative set of glyphs covering Latin caps,
-// Latin descenders, CJK extremes (tallest + lowest), and box-drawing /
-// math symbols. Take the max ascent and max descent across the set; cellH =
-// ceil(maxAscent + maxDescent). At 10px this works out to 7 + 2 = 9,
-// matching the previous hardcoded value byte-for-byte; at 12px it gives
-// 8 + 2 = 10; at 16px it gives 10 + 6 = 16 (CJK descenders kick in).
-const mLatin = pctx.measureText('M');
-const mCjk = pctx.measureText('中');
-const ratio = mCjk.width / mLatin.width;
-// Allow tiny float drift (e.g. 1.99999 vs 2.0) but reject anything that
-// clearly isn't East Asian Wide. 0.01 absolute tolerance is generous.
-if (Math.abs(ratio - 2) > 0.01) {
-  throw new Error(
-    `[gen-atlas] expected CJK advance = 2×Latin, got ratio=${ratio.toFixed(4)} ` +
-      `(latin=${mLatin.width}, cjk=${mCjk.width}). ` +
-      `Renderer assumes East Asian Width = Wide for CJK Unified Ideographs.`,
-  );
-}
-const cellW = Math.ceil(mLatin.width);
-
-// Probe glyphs covering the extremes we need to cover:
-//   - 'M'      : Latin caps (mid ascent, no descent)
-//   - 'gpy'    : Latin descenders (deepest in Latin)
-//   - '中漢國' : CJK ascent ceiling
-//   - '⌊∫'    : math + box-drawing descenders
-// We measure each, take max(ascent), max(descent), and round up.
-const heightProbes = ['M', 'g', 'p', 'y', 'j', '中', '漢', '國', '⌊', '∫', '日', 'カ'];
+pctx.font = `${PRIMARY_FONT_PX}px ${PRIMARY_FONT_FAMILY}`;
+const primaryLatin = pctx.measureText('M');
 let maxAscent = 0;
 let maxDescent = 0;
-for (const ch of heightProbes) {
+for (const ch of ['M', 'g', 'p', 'y', 'j', '0', 'O', 'l', 'I', '{', '}', '[', ']']) {
   const m = pctx.measureText(ch);
-  // actualBoundingBoxAscent / Descent give the inked extent of the glyph
-  // (in pixels above / below the baseline). Some glyphs (box-drawing) have
-  // NEGATIVE descent (they sit above baseline); clamp to 0 for those.
-  const asc = m.actualBoundingBoxAscent;
-  const desc = m.actualBoundingBoxDescent;
-  if (Number.isFinite(asc) && asc > maxAscent) maxAscent = asc;
-  if (Number.isFinite(desc) && desc > maxDescent) maxDescent = desc;
+  if (Number.isFinite(m.actualBoundingBoxAscent) && m.actualBoundingBoxAscent > maxAscent) {
+    maxAscent = m.actualBoundingBoxAscent;
+  }
+  if (Number.isFinite(m.actualBoundingBoxDescent) && m.actualBoundingBoxDescent > maxDescent) {
+    maxDescent = m.actualBoundingBoxDescent;
+  }
 }
-const ascent = Math.ceil(maxAscent);
-const descent = Math.ceil(maxDescent);
-const cellH = ascent + descent;
+// Also verify fallback fits in the same height budget at its own baseline.
+pctx.font = `${FALLBACK_FONT_PX}px ${FALLBACK_FONT_FAMILY}`;
+for (const ch of ['M', 'g', 'p', 'y', 'j', '中', '漢', '國', '⌊', '∫', '日', 'カ', '한']) {
+  const m = pctx.measureText(ch);
+  if (Number.isFinite(m.actualBoundingBoxAscent) && m.actualBoundingBoxAscent > maxAscent) {
+    maxAscent = m.actualBoundingBoxAscent;
+  }
+  if (Number.isFinite(m.actualBoundingBoxDescent) && m.actualBoundingBoxDescent > maxDescent) {
+    maxDescent = m.actualBoundingBoxDescent;
+  }
+}
+
+const cellW = Math.ceil(primaryLatin.width); // 5 at Spleen 8px
+const ascent = Math.ceil(maxAscent); // 7 for Spleen/Unifont 8px
+const descent = Math.ceil(maxDescent); // 1 for Spleen/Unifont 8px
+const cellH = ascent + descent; // 8
+
+if (cellW !== 5 || cellH !== 8) {
+  throw new Error(
+    `[gen-atlas] Spleen 5x8 invariant drifted: got cell=${cellW}×${cellH} ` +
+      `(asc=${ascent} desc=${descent}). Refusing to silently change density.`,
+  );
+}
+
+// Probe fallback advance against fallback's own Latin baseline. We classify
+// fallback glyphs as one or two visual cells, then paint them into Spleen's
+// 5px or 10px cell width. This keeps CJK wrapping at 2 cells even though
+// Unifont 8px ink itself is 8px wide.
+pctx.font = `${FALLBACK_FONT_PX}px ${FALLBACK_FONT_FAMILY}`;
+const fallbackLatinW = pctx.measureText('M').width;
+if (!Number.isFinite(fallbackLatinW) || fallbackLatinW <= 0) {
+  throw new Error('[gen-atlas] could not measure fallback Unifont Latin width');
+}
 
 console.log(
-  `[gen-atlas] font=${FONT_FAMILY} px=${FONT_PX} profile=${PROFILE} ` +
+  `[gen-atlas] font=${FONT_FAMILY_LABEL} profile=${PROFILE} ` +
     `cell=${cellW}×${cellH} (asc=${ascent} desc=${descent}, wide=${2 * cellW}×${cellH})`,
 );
-
-// --- Enumerate the codepoint set ------------------------------------------
-// For each range, walk every codepoint and keep only those Unifont actually
-// has a glyph for. @napi-rs/canvas returns 0 for codepoints not in the cmap;
-// we use that as the absence test. Then categorize by advance width: narrow
-// (== cellW) or wide (== 2*cellW). Anything else means a font version drift
-// — fail loudly rather than silently corrupt the atlas.
 
 interface Found {
   cp: number;
   wide: boolean;
+  source: 'primary' | 'fallback';
 }
+
+function sourceForCodepoint(cp: number): 'primary' | 'fallback' {
+  // Code-font-first means the exact ASCII/code glyphs that dominate Claude
+  // Code prompts use Spleen. Unicode punctuation/symbols/CJK keep Unifont.
+  if (cp >= 0x20 && cp <= 0x7e) return 'primary';
+  return 'fallback';
+}
+
+function classifyFallbackWidth(cp: number): boolean | null {
+  const ch = String.fromCodePoint(cp);
+  const w = pctx.measureText(ch).width;
+  if (!Number.isFinite(w) || w <= 0) return null;
+  const ratio = w / fallbackLatinW;
+  if (Math.abs(ratio - 1) < 0.05) return false;
+  if (Math.abs(ratio - 2) < 0.05) return true;
+  throw new Error(
+    `[gen-atlas] fallback codepoint U+${cp.toString(16).toUpperCase()} has advance ` +
+      `${w}px (Unifont Latin=${fallbackLatinW}px, ratio=${ratio.toFixed(3)}; expected 1× or 2×).`,
+  );
+}
+
 const found: Found[] = [];
 for (const [lo, hi, label] of RANGES) {
   let kept = 0;
+  let primary = 0;
+  let fallback = 0;
   for (let cp = lo; cp <= hi; cp++) {
-    const w = pctx.measureText(String.fromCodePoint(cp)).width;
-    if (w === 0) continue; // not in cmap
-    // Classify by raw advance ratio against the Latin baseline. Tolerant of
-    // half-pixel drift (Unifont at odd sizes reports e.g. 5.5 / 11.0). Round
-    // up to integer cells so glyphs never get clipped on the right edge.
-    const ratioToLatin = w / mLatin.width;
-    if (Math.abs(ratioToLatin - 1) < 0.01) found.push({ cp, wide: false });
-    else if (Math.abs(ratioToLatin - 2) < 0.01) found.push({ cp, wide: true });
-    else {
-      throw new Error(
-        `[gen-atlas] codepoint U+${cp.toString(16).toUpperCase()} has advance ` +
-          `${w}px (Latin=${mLatin.width}px, ratio=${ratioToLatin.toFixed(3)}; ` +
-          `expected 1× or 2×). Font version drift?`,
-      );
+    const source = sourceForCodepoint(cp);
+    if (source === 'primary') {
+      found.push({ cp, wide: false, source });
+      primary++;
+      kept++;
+      continue;
     }
+    const wide = classifyFallbackWidth(cp);
+    if (wide == null) continue;
+    found.push({ cp, wide, source });
+    fallback++;
     kept++;
   }
   console.log(
     `[gen-atlas]   ${label.padEnd(48)} ` +
       `U+${lo.toString(16).padStart(4, '0').toUpperCase()}..` +
       `U+${hi.toString(16).padStart(4, '0').toUpperCase()}  ` +
-      `kept ${kept}/${hi - lo + 1}`,
+      `kept ${kept}/${hi - lo + 1} (spleen=${primary}, unifont=${fallback})`,
   );
 }
-// Sort by codepoint so the runtime can binary-search.
+
 found.sort((a, b) => a.cp - b.cp);
 const wideCount = found.filter((f) => f.wide).length;
-console.log(`[gen-atlas] total glyphs: ${found.length} (${wideCount} wide)`);
+const primaryCount = found.filter((f) => f.source === 'primary').length;
+console.log(`[gen-atlas] total glyphs: ${found.length} (${wideCount} wide, ${primaryCount} Spleen primary)`);
 
-// --- Rasterize each glyph --------------------------------------------------
-// All glyphs go into a single flat Uint8Array; OFFSETS[] points into it.
-// Width depends on the glyph (cellW or 2*cellW); height is always cellH.
+// --- Rasterize glyphs ------------------------------------------------------
+const contexts = {
+  primary: {
+    narrow: createCanvas(cellW, cellH).getContext('2d'),
+    wide: createCanvas(2 * cellW, cellH).getContext('2d'),
+    font: `${PRIMARY_FONT_PX}px ${PRIMARY_FONT_FAMILY}`,
+  },
+  fallback: {
+    narrow: createCanvas(cellW, cellH).getContext('2d'),
+    wide: createCanvas(2 * cellW, cellH).getContext('2d'),
+    font: `${FALLBACK_FONT_PX}px ${FALLBACK_FONT_FAMILY}`,
+  },
+} as const;
+for (const src of [contexts.primary, contexts.fallback]) {
+  for (const ctx of [src.narrow, src.wide]) {
+    ctx.font = src.font;
+    ctx.textBaseline = 'alphabetic';
+  }
+}
 
-const wideCanvas = createCanvas(2 * cellW, cellH);
-const wideCtx = wideCanvas.getContext('2d');
-wideCtx.font = `${FONT_PX}px ${FONT_FAMILY}`;
-wideCtx.textBaseline = 'alphabetic';
-
-const narrowCanvas = createCanvas(cellW, cellH);
-const narrowCtx = narrowCanvas.getContext('2d');
-narrowCtx.font = `${FONT_PX}px ${FONT_FAMILY}`;
-narrowCtx.textBaseline = 'alphabetic';
-
-// Pixel data is BIT-PACKED, MSB-first. Unifont glyphs are inherently 1-bit
-// (every pixel is exactly 0 or 255 — no antialiasing), so storing as bytes
-// wastes 7 bits/pixel. The runtime decoder extracts the bit at index
-//   bitIdx = OFFSETS[rank] + row * srcW + col
-// where srcW is `cellW` for narrow glyphs or `2*cellW` for wide (CJK) ones —
-// driven by WIDE_FLAGS[rank]. OFFSETS is now a BIT offset (was byte offset
-// in the prior 8-bit format). Bit indices fit comfortably in Uint32:
-// 35k glyphs × 10×11 px max = ~3.9M bits, well under 2^32.
 const codepoints = new Uint32Array(found.length);
 const offsets = new Uint32Array(found.length);
 const wideFlags = new Uint8Array(found.length);
-// Collect per-glyph bit slices first; we'll pack them into a single
-// MSB-first bitstream at the end so glyph N starts exactly where glyph N-1
-// ended (no byte alignment between glyphs).
-const cellBitSlices: Uint8Array[] = []; // one entry per glyph; values are 0 or 1
+const cellBitSlices: Uint8Array[] = [];
 let totalBits = 0;
 
 for (let i = 0; i < found.length; i++) {
-  const { cp, wide } = found[i]!;
+  const { cp, wide, source } = found[i]!;
   codepoints[i] = cp;
   wideFlags[i] = wide ? 1 : 0;
   offsets[i] = totalBits;
 
   const w = wide ? 2 * cellW : cellW;
-  const ctx = wide ? wideCtx : narrowCtx;
+  const ctx = wide ? contexts[source].wide : contexts[source].narrow;
 
-  // Paint glyph: black canvas, white text. R-channel coverage is what we keep.
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, w, cellH);
   ctx.fillStyle = '#fff';
   ctx.fillText(String.fromCodePoint(cp), 0, ascent);
 
   const img = ctx.getImageData(0, 0, w, cellH);
-  // Threshold the R channel to 1-bit. Unifont is already 0/255 black-and-
-  // white so the threshold is academic, but use ≥128 for safety against
-  // any subpixel-rendering surprises.
   const bits = new Uint8Array(w * cellH);
   for (let p = 0; p < bits.length; p++) bits[p] = img.data[p * 4]! >= 128 ? 1 : 0;
   cellBitSlices.push(bits);
   totalBits += bits.length;
 }
 
-// Pack into MSB-first bitstream: bit at index B lives in byte B>>3 at
-// position 7-(B&7). Total bytes = ceil(totalBits / 8).
 const totalBytes = (totalBits + 7) >>> 3;
 const pixels = new Uint8Array(totalBytes);
 {
@@ -273,11 +255,6 @@ console.log(
     `(was ${totalBits} bytes at 8-bit; ${(totalBits / totalBytes).toFixed(1)}× pre-deflate shrink)`,
 );
 
-// --- Encode binary blobs as base64 ----------------------------------------
-// JSON array literals of 41k numbers would blow up atlas.ts to several MB
-// of TS source. base64'd typed-array bytes are ~6× tighter and the decoder
-// is 10 lines that runs once at module load.
-
 function bytesB64(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString('base64');
 }
@@ -291,13 +268,12 @@ console.log(
     `offsets=${offsetsB64.length} wide=${wideFlagsB64.length} pixels=${pixelsB64.length}`,
 );
 
-// --- Emit src/core/atlas.ts -----------------------------------------------
 const banner = `// AUTO-GENERATED by scripts/gen-atlas.ts — DO NOT EDIT.
 // Regenerate with: pnpm run build:atlas
 //   (or ATLAS_PROFILE=practical pnpm run build:atlas to drop Hangul for
 //    Workers free-tier deployments under the 1 MB compressed-bundle cap)
-// Source font: assets/Unifont-16.0.04.otf @ ${FONT_PX}px (profile: ${PROFILE})
-// Glyphs: ${found.length} codepoints (${wideCount} wide)
+// Source fonts: assets/Spleen-5x8.otb @ ${PRIMARY_FONT_PX}px for ASCII/code; assets/Unifont-16.0.04.otf @ ${FALLBACK_FONT_PX}px fallback (profile: ${PROFILE})
+// Glyphs: ${found.length} codepoints (${wideCount} wide, ${primaryCount} Spleen primary)
 `;
 
 const body = `
@@ -309,10 +285,10 @@ export const ATLAS_CELL_H = ${cellH};
 export const ATLAS_ASCENT = ${ascent};
 /** Distance from baseline to cell bottom. */
 export const ATLAS_DESCENT = ${descent};
-/** Font size used when rasterizing. */
-export const ATLAS_FONT_PX = ${FONT_PX};
-/** Font family name used at build time. Renderer never re-loads the font. */
-export const ATLAS_FONT_FAMILY = ${JSON.stringify(FONT_FAMILY)};
+/** Primary font size used when rasterizing ASCII/code glyphs. */
+export const ATLAS_FONT_PX = ${PRIMARY_FONT_PX};
+/** Font family label used at build time. Renderer never re-loads the font. */
+export const ATLAS_FONT_FAMILY = ${JSON.stringify(FONT_FAMILY_LABEL)};
 /** Profile used to build this atlas. */
 export const ATLAS_PROFILE = ${JSON.stringify(PROFILE)};
 
@@ -340,22 +316,18 @@ function decodeU32(b64: string): Uint32Array {
  *  at \`rank\` in OFFSETS / WIDE_FLAGS / PIXELS. */
 export const ATLAS_CODEPOINTS: Uint32Array = /* @__PURE__ */ decodeU32(CODEPOINTS_B64);
 
-/** BIT offset into ATLAS_PIXELS for the glyph at each rank. (Was byte offset
- *  in the prior 8-bit format.) */
+/** BIT offset into ATLAS_PIXELS for the glyph at each rank. */
 export const ATLAS_OFFSETS: Uint32Array = /* @__PURE__ */ decodeU32(OFFSETS_B64);
 
 /** 1 if the glyph at this rank is double-wide (East Asian Wide), 0 otherwise. */
 export const ATLAS_WIDE_FLAGS: Uint8Array = /* @__PURE__ */ decodeB64(WIDE_FLAGS_B64);
 
-/** Bit-packed 1-bit pixel data, MSB-first. Unifont glyphs are inherently
- *  1-bit (every pixel is 0 or 255 — no antialiasing), so we store 8 px per
- *  byte. The runtime decoder (blitGlyph) extracts:
+/** Bit-packed 1-bit pixel data, MSB-first. Runtime extraction:
  *    bitIdx  = OFFSETS[rank] + row * srcW + col
  *    byteIdx = bitIdx >>> 3
  *    bitOff  = 7 - (bitIdx & 7)
- *    pixel   = (ATLAS_PIXELS[byteIdx] >>> bitOff) & 1   // 0 or 1
- *  where srcW is CELL_W (narrow) or 2*CELL_W (wide, per WIDE_FLAGS[rank]).
- *  Output framebuffer maps 0 → 0 (background) and 1 → 255 (full ink). */
+ *    pixel   = (ATLAS_PIXELS[byteIdx] >>> bitOff) & 1
+ *  where srcW is CELL_W (narrow) or 2*CELL_W (wide, per WIDE_FLAGS[rank]). */
 export const ATLAS_PIXELS: Uint8Array = /* @__PURE__ */ decodeB64(PIXELS_B64);
 
 /** Number of glyphs in the atlas. */

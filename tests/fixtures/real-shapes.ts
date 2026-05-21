@@ -9,8 +9,8 @@
  *
  * ## Why these matter
  *
- * `SLAB_CHARS_PER_TOKEN = 2.5` and `HISTORY_CHARS_PER_TOKEN = 2.5` are frozen
- * empirical fits from H=354 samples. The synthetic `'A'.repeat(N)` shapes
+ * `SLAB_CHARS_PER_TOKEN = 2.0` and `HISTORY_CHARS_PER_TOKEN = 2.0` are frozen
+ * empirical fits from Opus 4.7 production samples. The synthetic `'A'.repeat(N)` shapes
  * elsewhere in the suite prove the *math* is wired correctly; these prove the
  * *constants* still match real Claude Code traffic. If a future model variant
  * (Sonnet 4.6 vs Opus 4.7) tokenizes differently and the textbook 4 chars/token
@@ -45,21 +45,18 @@ export interface RealShape {
 /**
  * The production-shape slab that motivated the `e8545a9` fix.
  *
- * Before the fix: gate estimated `text_tokens = 161101/4 = 40275` and rejected
- * because `image_cost (8 × 5500 = 44000) > text_tokens`. After the fix with
- * `SLAB_CHARS_PER_TOKEN = 2.5`: `text_tokens = 161101/2.5 = 64440`, which is
- * 20k tokens above the conservative image cost — clear ACCEPT with safety
- * margin.
- *
- * Real `count_tokens` probe measured ~99k tokens for this body (cpt ≈ 1.62),
- * so the gate's 2.5 estimate (64k tok) is still a *lower bound* on the real
- * cost. We compress when we know we'll win; we don't risk net-losers.
+ * Before the fix: gate used the textbook `chars/token=4` and rejected dense
+ * Claude Code slabs because it under-counted text cost. The current Opus-4.7
+ * gate uses `SLAB_CHARS_PER_TOKEN = 2.0`, which remains a lower-bound
+ * estimate versus real `count_tokens` (~99k tokens for this body, cpt≈1.62)
+ * while making this shape a clear ACCEPT. We compress when we know we'll win;
+ * we don't risk net-losers.
  */
 export const PRODUCTION_SLAB_161K: RealShape = {
   name: 'production slab (161k chars, multi-col)',
   origChars: 161101,
   numCols: 2,
-  approxCharsPerRow: 52, // 11 images × 141 lines/image × 2 cols ≈ 3102 rows
+  approxCharsPerRow: 52, // 8 images × 195 lines/image × 2 cols ≈ 3120 rows
   decision: 'accept',
   gate: 'slab',
   baselineTokens: 99478,
@@ -77,9 +74,8 @@ export const PRODUCTION_SLAB_161K: RealShape = {
  *
  * The production event for this shape was compressed (gate accepted), but
  * the synthetic `'A'.repeat(19)` lines we generate from the shape don't
- * capture the real density. With ~6533 lines / 141 rows-per-image / 2
- * multiCol ≈ 24 images × 5500 = 132k img-tokens vs 130665/2.5 = 52k
- * text-tokens → the gate REJECTS the synthetic form even at cpt=2.5.
+ * capture the real density. The synthetic form still overruns the text-token
+ * budget under the conservative cpt=2.0 gate, so it REJECTS.
  *
  * The fixture pins the gate's decision on the *synthetic* shape, not the
  * production outcome. Real text at this density (mixed line lengths, dense
@@ -101,9 +97,9 @@ export const PRODUCTION_SLAB_135K_DENSE: RealShape = {
  * The largest production slab we have data for. ~16 chars/row — almost all
  * newlines (deeply nested JSON or tabular tool output).
  *
- * At cpt=4 textbook estimate: `169632/4 = 42408` tok vs `image_cost = 37 ×
- * 5500 / 2 ≈ 101750` tok → REJECT. At cpt=2.5: `169632/2.5 = 67852` tok —
- * still REJECT under the gate's conservative math, and production confirms
+ * At cpt=4 textbook estimate the text is badly undercounted; even at the
+ * current conservative cpt=2.0, this newline-heavy synthetic shape still
+ * REJECTS under the gate's image-cost math, and production confirms
  * this: the event has `compressed=true` because by the time the slab grew
  * that large the *real* token count (count_tokens ≈ image_cost) had crossed
  * over. The gate is conservative; the regression test pins that the gate
@@ -161,7 +157,7 @@ export const BELOW_MIN_CHARS_BORDERLINE: RealShape = {
  * (537k chars) into one synthetic prepended user message + image block.
  *
  * Pinned here so the regression test confirms the `historyReason:
- * 'collapsed'` path stays healthy under `HISTORY_CHARS_PER_TOKEN = 2.5`.
+ * 'collapsed'` path stays healthy under `HISTORY_CHARS_PER_TOKEN = 2.0`.
  * Same workload as the slab fix; this exercises the *different* call site.
  */
 export const HISTORY_COLLAPSED_LONG_SESSION: RealShape = {

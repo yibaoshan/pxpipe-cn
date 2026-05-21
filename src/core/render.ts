@@ -309,7 +309,7 @@ export async function renderTextToPngs(
 // --- R2 multi-column rendering --------------------------------------------
 //
 // Single-column packing leaves Anthropic's 1568×1568 image area badly
-// under-used: at cell 5×11 and cols=100, our render canvas is only 508 px
+// under-used: at cell 5×8 and cols=100, our render canvas is only 508 px
 // wide — ~32% of the horizontal budget. Most real Claude Code tool docs +
 // CLAUDE.md content wraps at well under 100 chars/row, so we end up paying
 // the per-image cost (~2,500 tokens) for an image that's mostly whitespace.

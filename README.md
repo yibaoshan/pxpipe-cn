@@ -97,11 +97,12 @@ Claude Code  ──►  pixelpipe  ──►  │  (system + tools as text)     
 
 The proxy intercepts `POST /v1/messages`, pulls the system prompt + tool
 documentation out of the JSON body, renders it into one or more grayscale
-PNGs using a build-time-generated GNU Unifont glyph atlas (~35k BMP
-codepoints by default — Latin, Cyrillic, Greek, CJK, Hiragana, Katakana,
-Hangul, Hebrew, Arabic, math symbols, box drawing, decorative symbols),
-and substitutes those PNGs back in as `image` content blocks with an
-`ephemeral` `cache_control` breakpoint.
+PNGs using a build-time-generated hybrid glyph atlas: Spleen 5×8 for
+printable ASCII/code glyphs, with GNU Unifont 8px fallback for ~35k BMP
+codepoints by default — Latin extended, Cyrillic, Greek, CJK, Hiragana,
+Katakana, Hangul, Hebrew, Arabic, math symbols, box drawing, decorative
+symbols. It substitutes those PNGs back in as `image` content blocks with
+an `ephemeral` `cache_control` breakpoint.
 
 Three independent derivations, each anchored on a number you can verify
 against the source.
@@ -131,21 +132,20 @@ billed.
 
 The "English prose ≈ 4 chars/token" rule from Anthropic's
 [pricing docs](https://docs.anthropic.com/en/docs/about-claude/pricing)
-does not survive contact with real Claude Code traffic. Across N=354
-production `count_tokens` probes on real `/v1/messages` bodies:
+does not survive contact with real Claude Code traffic. Across N=391
+production `count_tokens` probes on Opus 4.7 `/v1/messages` bodies:
 
 ```
-median  1.17 chars/token
-p75     1.19 chars/token
-p95     2.50 chars/token
-max     2.62 chars/token
+avg outgoing text chars  231,925
+avg real input tokens    115,893
+observed mean            1.91 chars/token
 ```
 
 Real bodies are JSON-dense — tool definitions, schemas, structured
 `CLAUDE.md` slabs, `tool_result` blocks — which tokenize 2-4× denser than
 prose. The gate `isCompressionProfitable()` uses
-`SLAB_CHARS_PER_TOKEN = 2.5` at the slab call site (the 95th percentile of
-observed real cpt with a small safety margin), so it only compresses when
+`SLAB_CHARS_PER_TOKEN = 2.0` at the slab call site (slightly conservative
+versus the observed 1.91 cpt), so it only compresses when
 the text actually costs more tokens than the image will. At the textbook
 4 ch/tok the gate silently rejects every realistic slab as
 `not_profitable` — that bug is what motivates the constant.
@@ -307,8 +307,9 @@ recognizing font family/style. For pixelpipe this means:
 - There is no separate letter-spacing knob — density is mostly the atlas
   cell (`ATLAS_CELL_W × ATLAS_CELL_H`).
 - The promising foundational experiment is a denser-but-readable bitmap
-  atlas (e.g. current Unifont 5×11 → candidate 4×8 or 4×7), with exact
-  retrieval tests on code/tool-doc slabs before making it default. Avoid
+  atlas. We now ship a conservative version of that idea: Spleen 5×8 for
+  ASCII/code plus Unifont 8px fallback, after 4×8 proved too brittle in
+  exact code-reading tests. Avoid
   jumping to ~6 px effective text height without quality evidence.
 - Gutter/padding changes are secondary; the gutter is an OCR-ordering cue
   for multi-column layouts, so removing it can save pixels while silently
@@ -448,9 +449,8 @@ prose. The N=10 rejected history events in `events.jsonl` had real cpt
 1.08–1.10 — every one of them was a profitable compression the gate
 dropped on the floor.
 
-Fixed by wiring `HISTORY_CHARS_PER_TOKEN = 2.5` at the call site (same
-shape as the slab's `SLAB_CHARS_PER_TOKEN = 2.5` fix from `e8545a9`
-earlier today). Live data after restart shows it firing: the 12:30:01
+Fixed by wiring `HISTORY_CHARS_PER_TOKEN = 2.0` at the call site (same
+shape as the slab's `SLAB_CHARS_PER_TOKEN = 2.0` Opus-4.7 calibration). Live data after restart shows it firing: the 12:30:01
 event in `events.jsonl` has `historyReason: 'collapsed'`,
 `collapsed_turns: 175`, `collapsed_chars: 180,684`.
 
@@ -738,38 +738,40 @@ src/
 └── worker.ts          export default { fetch }
 
 scripts/
-├── gen-atlas.ts       build-time: OTF → atlas.ts (uses @napi-rs/canvas)
+├── gen-atlas.ts       build-time: font files → atlas.ts (uses @napi-rs/canvas)
 └── build.mjs          esbuild bundler for Node target
 
 assets/
-├── Unifont-16.0.04.otf       primary font (~35k BMP codepoints w/ full-bmp profile)
+├── Spleen-5x8.otb            primary ASCII/code bitmap font (BSD-2-Clause)
+├── SPLEEN_LICENSE.txt        Spleen license
+├── Unifont-16.0.04.otf       Unicode fallback (~35k BMP codepoints w/ full-bmp profile)
 ├── UNIFONT_LICENSE.txt       OFL + GPL-with-font-exception
 └── JetBrainsMono-Regular.ttf legacy / ASCII-only fallback (kept on disk)
 ```
 
-The atlas is generated **at build time** from `Unifont-16.0.04.otf`,
-base64-inlined into a `.ts` file with sparse codepoint + offset tables
-(binary-packed), and shipped with the bundle. At runtime there are zero
-external files to read and zero non-Web-Standard imports — that's the
-only way this works in Workers without per-request asset fetches.
+The atlas is generated **at build time** from `Spleen-5x8.otb` (printable
+ASCII/code) plus `Unifont-16.0.04.otf` (Unicode fallback), base64-inlined
+into a `.ts` file with sparse codepoint + offset tables (binary-packed),
+and shipped with the bundle. At runtime there are zero external files to
+read and zero non-Web-Standard imports — that's the only way this works
+in Workers without per-request asset fetches.
 
 Regenerate the atlas (after swapping fonts, sizes, or codepoint profile):
 
 ```bash
-pnpm run build:atlas                          # default: full-bmp (~35k cp, all BMP Unifont covers)
+pnpm run build:atlas                          # default: Spleen 5×8 ASCII + full-bmp Unifont fallback
 ATLAS_PROFILE=practical pnpm run build:atlas  # drops Hangul (~24k cp; for Workers free-tier)
-FONT_PX=12 pnpm run build:atlas               # nondefault size; verify cells
 ```
 
 ---
 
 ## Limitations
 
-- The bundled GNU Unifont at 10px (cell 5×11 px Latin, 10×11 CJK) is
-  Anthropic-OCR-clean for ~35k BMP codepoints by default (`full-bmp`
-  profile): Latin, Cyrillic, Greek, CJK Unified Ideographs, Hiragana,
-  Katakana, Hangul, Hebrew, Arabic, math symbols, box-drawing, arrows,
-  Dingbats, Letterlike Symbols, Enclosed Alphanumerics, etc. Drops for
+- The bundled hybrid atlas uses Spleen 5×8 for printable ASCII/code and
+  Unifont 8px fallback for ~35k BMP codepoints by default (`full-bmp`
+  profile): Latin extended, Cyrillic, Greek, CJK Unified Ideographs,
+  Hiragana, Katakana, Hangul, Hebrew, Arabic, math symbols, box-drawing,
+  arrows, Dingbats, Letterlike Symbols, Enclosed Alphanumerics, etc. Drops for
   codepoints outside the profile (e.g. emoji 😀 — supplementary plane)
   get counted in `events.jsonl#dropped_chars` (with the top-20 broken
   out as `dropped_codepoints_top`) so you can spot patterns. For
