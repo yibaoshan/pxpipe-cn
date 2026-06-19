@@ -5,6 +5,7 @@ from PIL import Image, ImageDraw, ImageFont
 FONT = "/System/Library/Fonts/SFNSMono.ttf"
 WORK = "/tmp/needle_eval/sweep"
 os.makedirs(WORK, exist_ok=True)
+CCI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "cci.py")
 W, H = 1568, 1276          # pxpipe-equivalent dims -> ~2668 image tokens
 IMG_TOKENS = round(W*H/750)
 
@@ -44,9 +45,9 @@ def render(pt, path, needle_val):
 def ask(path):
     p=(f"Read the image at {path}. What is the value of SECRET_TOKEN? "
        "Reply with ONLY the value, no other words.")
-    out=subprocess.run(["claude","-p","--model","claude-opus-4-8",
-        "--no-session-persistence",p],capture_output=True,text=True,
-        timeout=120,cwd=WORK).stdout
+    out=subprocess.run([sys.executable,CCI,"--model","claude-opus-4-8",
+        "--allowedTools","Read",p],capture_output=True,text=True,
+        timeout=120,cwd=WORK,env=dict(os.environ,CCI_TIMEOUT="100")).stdout
     m=re.search(r'[0-9a-f]{12}',out); return m.group(0) if m else ""
 
 def run(pt,n):

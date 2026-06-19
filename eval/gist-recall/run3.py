@@ -6,12 +6,14 @@ from concurrent.futures import ThreadPoolExecutor
 WORK = os.path.abspath('work3')
 MODEL = os.environ.get('MODEL', 'claude-fable-5')
 CLAUDE = os.path.expanduser('~/.claude/local/claude')
+CCI = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'lib', 'cci.py')
 probes = json.load(open(f'{WORK}/probes.json'))
 env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_BASE_URL'}
+env['CCI_TIMEOUT'] = '210'   # self-exit before the subprocess timeout=240 hard kill
 
 def ask(prompt):
     try:
-        r = subprocess.run([CLAUDE, '-p', '--model', MODEL, prompt],
+        r = subprocess.run([sys.executable, CCI, '--model', MODEL, '--allowedTools', 'Read', prompt],
                            capture_output=True, text=True, timeout=240, env=env)
         return r.stdout.strip()
     except Exception as e:

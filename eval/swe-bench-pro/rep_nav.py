@@ -14,6 +14,7 @@ IID = "instance_navidrome__navidrome-677d9947f302c9f7bba8c08c788c3dc99f235f39"
 WORK = os.path.expanduser("~/swe-pro-nav-rep")
 CACHE = os.path.expanduser("~/swe-pro-bench/cache")
 CLAUDE = os.path.expanduser("~/.claude/local/claude")
+CCI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "cci.py")
 MODEL = "claude-fable-5"
 PORT = 47825
 LOG = os.path.expanduser("~/.pxpipe/events-nav-rep.jsonl")
@@ -72,7 +73,8 @@ def main():
         requirements=(inst.get("requirements") or "").strip() or "(see issue)",
         interface=(inst.get("interface") or "").strip() or "No new interfaces are introduced.",
     )
-    env = dict(os.environ, ANTHROPIC_BASE_URL=f"http://127.0.0.1:{PORT}")
+    env = dict(os.environ, ANTHROPIC_BASE_URL=f"http://127.0.0.1:{PORT}",
+               CCI_TIMEOUT=str(TIMEOUT - 30), CCI_QUIET_S="6")
     for i in range(1, REPS + 1):
         d = os.path.join(WORK, f"rep{i}")
         pf = os.path.join(WORK, f"patch_rep{i}.diff")
@@ -84,7 +86,7 @@ def main():
             print(f"rep{i}: checkout-fail"); continue
         t0 = time.time()
         try:
-            r = subprocess.run([CLAUDE, "-p", "--model", MODEL, "--dangerously-skip-permissions", prompt],
+            r = subprocess.run([sys.executable, CCI, "--model", MODEL, prompt],
                                cwd=d, env=env, capture_output=True, text=True, timeout=TIMEOUT)
             rc, tail = r.returncode, ((r.stdout or "") + (r.stderr or ""))[-800:]
         except subprocess.TimeoutExpired:

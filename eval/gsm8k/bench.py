@@ -1,7 +1,7 @@
 # GSM8K: text baseline vs pxpipe-rendered-image, both solved by `claude -p`.
 # The image arm gets ONLY the PNG (problem text not in the prompt), so it must
 # read the image to answer. Exact-match on the final integer.
-import json, subprocess, re, os
+import json, subprocess, re, os, sys
 from concurrent.futures import ThreadPoolExecutor
 
 N     = int(os.environ.get('N', '100'))
@@ -9,6 +9,7 @@ OFF   = int(os.environ.get('OFF', '100'))
 MODEL = os.environ.get('MODEL', 'claude-opus-4-8')
 DATA  = os.environ.get('GSM_DATA', '/tmp/gsm8k_test.jsonl')
 IMGS  = os.environ.get('GSM_IMGS', './imgs')
+CCI   = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'lib', 'cci.py')
 
 probs = [json.loads(l) for l in open(DATA).read().strip().split('\n')[OFF:OFF + N]]
 
@@ -26,8 +27,9 @@ def extract(out):
     return nums[-1] if nums else None
 def claude(prompt, timeout=180):
     try:
-        return subprocess.run(['claude', '-p', '--model', MODEL, prompt],
-                              capture_output=True, text=True, timeout=timeout).stdout
+        return subprocess.run([sys.executable, CCI, '--model', MODEL, '--allowedTools', 'Read', prompt],
+                              capture_output=True, text=True, timeout=timeout,
+                              env=dict(os.environ, CCI_TIMEOUT=str(max(30, timeout - 30)))).stdout
     except Exception:
         return ''
 def one(args):

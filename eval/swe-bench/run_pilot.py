@@ -8,6 +8,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = "/tmp/swe-pilot/cache"
 WORK = "/tmp/swe-pilot/work"
 CLAUDE = os.path.expanduser("~/.claude/local/claude")
+CCI = os.path.join(HERE, "..", "lib", "cci.py")
 ARMS = {"on": "http://localhost:47821", "off": "http://localhost:47822"}
 TIMEOUT = 1500  # 25 min per run, hard cap
 
@@ -44,12 +45,12 @@ def run_one(inst, arm):
     env = dict(os.environ,
                ANTHROPIC_BASE_URL=ARMS[arm],
                CLAUDE_CONFIG_DIR=os.path.expanduser("~/.claude"),
-               CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="1")
+               CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="1",
+               CCI_TIMEOUT=str(TIMEOUT - 30), CCI_QUIET_S="6")
     t0 = time.time()
     try:
         r = subprocess.run(
-            [CLAUDE, "-p", PROMPT.format(problem=inst["problem_statement"]),
-             "--dangerously-skip-permissions"],
+            [sys.executable, CCI, PROMPT.format(problem=inst["problem_statement"])],
             cwd=d, env=env, capture_output=True, text=True, timeout=TIMEOUT)
         status, out = r.returncode, (r.stdout or "")[-2000:]
     except subprocess.TimeoutExpired:

@@ -6,6 +6,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 WORK = "/tmp/needle_eval/crux"
 os.makedirs(WORK, exist_ok=True)
+CCI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "cci.py")
 
 def hexneedle():
     return secrets.token_hex(6)  # 12 hex chars
@@ -46,8 +47,9 @@ def ask_opus(path, what):
     prompt = (f"Read the image at {path}. {what} "
               "Reply with ONLY the value, no other words, no punctuation.")
     out = subprocess.run(
-        ["claude","-p","--model","claude-opus-4-8","--no-session-persistence", prompt],
+        [sys.executable, CCI, "--model", "claude-opus-4-8", "--allowedTools", "Read", prompt],
         capture_output=True, text=True, timeout=120, cwd=WORK,
+        env=dict(os.environ, CCI_TIMEOUT="100"),
     ).stdout
     m = re.search(r'[0-9a-f]{12}', out)
     return (m.group(0) if m else ""), out.strip().replace("\n"," ")[:80]

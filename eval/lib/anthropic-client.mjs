@@ -4,8 +4,8 @@
  * Model-call layer for the eval harness.
  *
  * Runs entirely on the local Claude Max subscription by shelling out to the
- * `claude` CLI in headless print mode (`claude -p`). NO Anthropic API key is
- * used or required.
+ * interactive `claude` TUI via the cci.py shim (NOT headless `claude -p`). NO
+ * Anthropic API key is used or required.
  *
  * Why the CLI and not the HTTP API:
  *   The operator runs on a Claude Max subscription, which does not expose a
@@ -33,11 +33,16 @@
 import { spawn } from 'node:child_process';
 import { writeFileSync, unlinkSync, existsSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
 // Real claude binary — NOT the shell alias, which injects the proxy base URL.
 const CLAUDE_BIN = join(homedir(), '.claude', 'local', 'claude');
+
+// Interactive shim: drives the real TUI (Max auth) instead of headless `claude -p`.
+const CCI_PY = join(dirname(fileURLToPath(import.meta.url)), 'cci.py');
+const PYTHON = process.env.CCI_PYTHON || 'python3';
 
 /**
  * Map any model string to a CLI alias so the CLI always resolves the latest
@@ -125,23 +130,22 @@ async function callClaudeCli(body, model) {
   const prompt = parts.join('\n');
 
   // Child env: strip the proxy override so the CLI hits the real API directly
-  // with the subscription OAuth token.
-  const env = { ...process.env };
+  // with the subscription OAuth token. Tall buffer so long transcriptions are
+  // not truncated by the visible screen height.
+  const env = { ...process.env, CCI_ROWS: process.env.CCI_ROWS || '1500' };
   delete env.ANTHROPIC_BASE_URL;
 
   const args = [
-    '-p',
+    CCI_PY,
     '--model', model,
     '--output-format', 'json',
-    '--no-session-persistence',
-    '--strict-mcp-config',           // load no MCP servers — keep the call lean
   ];
   if (imageCount > 0) args.push('--allowedTools', 'Read');
 
   let stdout = '', stderr = '';
   try {
     await new Promise((resolveP, rejectP) => {
-      const child = spawn(CLAUDE_BIN, args, { env });
+      const child = spawn(PYTHON, args, { env });
       child.stdout.on('data', d => { stdout += d; });
       child.stderr.on('data', d => { stderr += d; });
       child.on('error', rejectP);
@@ -174,10 +178,14 @@ async function callClaudeCli(body, model) {
     role:    'assistant',
     model,
     content: [{ type: 'text', text: parsed.result ?? '' }],
+    // Interactive mode has no clean server `usage` block. input_tokens is the
+    // /context estimate; total_cost_usd is the /cost server total. output_tokens
+    // is not separately reported by the interactive panels.
     usage: {
-      input_tokens:  parsed.usage?.input_tokens  ?? 0,
-      output_tokens: parsed.usage?.output_tokens ?? 0,
+      input_tokens:  parsed.context_tokens ?? 0,
+      output_tokens: 0,
     },
+    total_cost_usd: parsed.total_cost_usd ?? null,
   };
 }
 
