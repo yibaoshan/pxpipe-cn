@@ -513,16 +513,18 @@ describe('transformRequest history compression (always-on)', () => {
 
     // REGRESSION (slab survives collapse): messages[0] is the slab-bearing
     // first user message, NOT the synthetic history. It must still carry a real
-    // image (the system prompt + tool docs) AND the cache_control anchor — if
-    // collapse had swept it in, the slab would be reduced to an `[image]`
-    // placeholder and the marker would be gone.
+    // image (the system prompt + tool docs) — if collapse had swept it in, the
+    // slab would be reduced to an `[image]` placeholder.
     const slabMsg = reparsed.messages[0];
     expect(slabMsg.role).toBe('user');
     const slabImgs = slabMsg.content.filter((b: { type: string }) => b.type === 'image');
     expect(slabImgs.length).toBeGreaterThanOrEqual(1);
-    expect(slabImgs.some((b: { cache_control?: unknown }) => b.cache_control !== undefined)).toBe(true);
+    // The cache anchor relocates onto the history image (the last imaged block
+    // in prefix order), so the slab image no longer carries it after a collapse.
+    expect(slabImgs.some((b: { cache_control?: unknown }) => b.cache_control !== undefined)).toBe(false);
 
-    // The synthetic history image is at messages[1], AFTER the slab anchor.
+    // The synthetic history image is at messages[1], AFTER the slab anchor, and
+    // now holds the sole relocated cache_control breakpoint.
     expect(reparsed.messages[1].role).toBe('user');
     const content = reparsed.messages[1].content;
     expect(Array.isArray(content)).toBe(true);
@@ -531,6 +533,8 @@ describe('transformRequest history compression (always-on)', () => {
       type: 'text',
       text: '[End of earlier context.]',
     });
+    const histImgs = content.filter((b: { type: string }) => b.type === 'image');
+    expect(histImgs[histImgs.length - 1].cache_control).toBeDefined();
   });
 
   it('sets historyReason=no_closed_prefix when an open tool_use precedes the tail', async () => {
@@ -620,22 +624,52 @@ describe('transformRequest history compression (always-on)', () => {
     expect(explicit20.info.collapsedTurns).toBe(10);
   });
 
-  it('history-image blocks carry NO cache_control (slab anchor is the sole breakpoint)', async () => {
+  it('relocates the sole cache anchor onto the last history image (one stable prefix, no added marker)', async () => {
+    // Why: the history image sits AFTER the slab in prefix order. Anchoring the
+    // single breakpoint on it caches slab + history as ONE stable segment
+    // (created once, then read). Left unanchored, the history image only caches
+    // when the caller's roaming downstream marker lands after it — otherwise the
+    // largest block re-creates at 1.25x every turn.
     const msgs: Message[] = [];
     for (let i = 0; i < 15; i++) {
       const body = `turn ${i}: ` + bigPlain(3500);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
-    const { body, info } = await transformRequest(mkBody(msgs, bigPlain(80_000)));
+    // Marked system array (as real Claude Code sends) gives pxpipe exactly one
+    // caller marker to relocate.
+    const marked = new TextEncoder().encode(
+      JSON.stringify({
+        model: 'claude-3-5-sonnet',
+        system: [{ type: 'text', text: bigPlain(80_000), cache_control: { type: 'ephemeral' } }],
+        messages: msgs,
+      }),
+    );
+    const { body, info } = await transformRequest(marked);
     expect(info.collapsedImages).toBeGreaterThanOrEqual(1);
     const reparsed = JSON.parse(new TextDecoder().decode(body));
-    // Synthetic history is at messages[1], after the protected slab anchor.
-    const synth = reparsed.messages[1];
-    const imgs = synth.content.filter((b: { type: string }) => b.type === 'image');
-    expect(imgs.length).toBeGreaterThanOrEqual(1);
-    for (const img of imgs) {
-      expect(img.cache_control).toBeUndefined();
-    }
+
+    // Slab images survive but no longer carry the anchor.
+    const slabImgs = reparsed.messages[0].content.filter((b: { type: string }) => b.type === 'image');
+    expect(slabImgs.length).toBeGreaterThanOrEqual(1);
+    for (const img of slabImgs) expect(img.cache_control).toBeUndefined();
+
+    // The LAST history image carries the breakpoint; earlier ones do not.
+    const histImgs = reparsed.messages[1].content.filter((b: { type: string }) => b.type === 'image');
+    expect(histImgs.length).toBeGreaterThanOrEqual(1);
+    histImgs.forEach((img: { cache_control?: unknown }, i: number) => {
+      if (i === histImgs.length - 1) expect(img.cache_control).toBeDefined();
+      else expect(img.cache_control).toBeUndefined();
+    });
+
+    // Pure relocation: exactly one cache_control across the whole request — the
+    // caller sent one (on the system slab); pxpipe moved it, never added.
+    const all = [
+      ...(Array.isArray(reparsed.system) ? reparsed.system : []),
+      ...reparsed.messages.flatMap((m: { content?: unknown }) =>
+        Array.isArray(m.content) ? m.content : [],
+      ),
+    ];
+    expect(all.filter((b: { cache_control?: unknown }) => b && b.cache_control !== undefined).length).toBe(1);
   });
 });
 

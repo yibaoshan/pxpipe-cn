@@ -693,6 +693,64 @@ async function historyImageSha8(
   return concat ? sha8(concat) : undefined;
 }
 
+/**
+ * After a history collapse, move pxpipe's single relocated cache breakpoint off
+ * the slab image and onto the LAST history image.
+ *
+ * The history image sits AFTER the slab in prefix order, so one marker on it
+ * caches the WHOLE imaged prefix (slab + history) as a single stable segment —
+ * created once, then read at the ~0.1x rate every turn. Without this the history
+ * image (usually the largest block) only lands in a cached prefix when the
+ * caller's roaming downstream marker happens to fall after it; when it doesn't,
+ * the entire history image re-creates at the 1.25x rate turn after turn.
+ *
+ * Pure relocation: it acts only when a slab image already carries the anchor, so
+ * the total marker count never increases (pxpipe never *adds* — only moves).
+ */
+function relocateAnchorToHistoryImage(messages: Message[] | undefined): void {
+  if (!Array.isArray(messages)) return;
+
+  // The synthetic history message is identified by its banner text block.
+  let historyImg: (ImageBlock & { cache_control?: unknown }) | undefined;
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    const first = m.content[0] as TextBlock | undefined;
+    if (!first || first.type !== 'text' || first.text !== '[Earlier in this conversation:]') continue;
+    for (let i = m.content.length - 1; i >= 0; i--) {
+      const b = m.content[i];
+      if (b && (b as ImageBlock).type === 'image') {
+        historyImg = b as ImageBlock & { cache_control?: unknown };
+        break;
+      }
+    }
+    break;
+  }
+  if (!historyImg) return;
+
+  // The slab anchor is the marked image BEFORE the '[End of rendered context.]'
+  // boundary in the slab-bearing message. Reminder/tool images sit after that
+  // boundary (or in other messages) and keep their own caller markers.
+  let slabAnchor: (ImageBlock & { cache_control?: unknown }) | undefined;
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    const hasBoundary = m.content.some(
+      (b) => b && (b as TextBlock).type === 'text' && (b as TextBlock).text === '[End of rendered context.]',
+    );
+    if (!hasBoundary) continue;
+    for (const b of m.content) {
+      if (b && (b as TextBlock).type === 'text' && (b as TextBlock).text === '[End of rendered context.]') break;
+      if (b && (b as ImageBlock).type === 'image' && (b as { cache_control?: unknown }).cache_control !== undefined) {
+        slabAnchor = b as ImageBlock & { cache_control?: unknown };
+      }
+    }
+    break;
+  }
+  if (!slabAnchor) return; // nothing to relocate → never add a marker
+
+  historyImg.cache_control = slabAnchor.cache_control;
+  delete slabAnchor.cache_control;
+}
+
 /** Best-effort extraction of the CLAUDE.md slab from a system text (heuristic).
  *  Returns empty string if nothing CLAUDE.md-shaped is detected. */
 export function extractClaudeMdSlab(staticText: string): string {
@@ -1852,6 +1910,10 @@ export async function transformRequest(
       info.historyTextChars = histInfo.collapsedChars;
       info.historyImageSha = await historyImageSha8(newMessages);
       bumpBucket(info, 'history', histInfo.collapsedChars);
+      // Move the single cache anchor onto the history image so slab + history
+      // cache as one stable prefix (created once, then read), instead of the
+      // history image re-creating whenever the caller's downstream marker moves.
+      relocateAnchorToHistoryImage(req.messages);
     } else if (histInfo.reason) {
       info.historyReason = histInfo.reason;
     }
