@@ -1,12 +1,21 @@
-// Server-rendered HTML for the dashboard - the AHA-without-the-A stack:
-// HTML fragments over the wire (htmx polls + swaps), Alpine for the little
-// bits of client state (toast tray). No client bundle, no build step - the
-// browser receives finished markup from the same process that owns the data.
+// Server-rendered HTML for the dashboard — htmx polls each fragment and swaps
+// it in; Alpine drives the toast tray only. No client bundle, no build step:
+// the browser receives finished markup from the same process that owns the
+// data, so the HTML and JSON surfaces can't drift.
 //
-// Layout, classes, colors and copy match the retired Svelte components 1:1
-// so the page is a visual no-op pre/post rewrite. Each former component is
-// now a render*Fragment() function; the polling cadence (2s live, 5s slow)
-// moved from Svelte stores to `hx-trigger="every Ns"` attributes.
+// 2026 redesign — goals:
+//   1. LIGHT theme with a flame-orange accent (no dark mode).
+//   2. LAYERED for two audiences: a plain-language answer on top for anyone
+//      who just started the proxy, and the full honesty math one click away
+//      (the "Show the math" drawer) for skeptics / power users.
+//   3. TRANSPARENT by default: every request can be opened to show exactly
+//      which parts of the context became an IMAGE (compressed, lossy) vs which
+//      stayed as TEXT (byte-exact) — and each rendered page can be paired with
+//      the original source text it was made from.
+//
+// The htmx endpoint names, element ids, polling cadences, and the JSON
+// payloads are unchanged from the previous version — this is presentation
+// only. Server code (src/dashboard.ts, src/node.ts) needs no edits.
 
 import { HTMX_JS, ALPINE_JS } from './vendor.js';
 import type {
@@ -19,7 +28,7 @@ import type {
   CurrentSessionPayload,
 } from './types.js';
 
-// ---- tiny helpers (formerly src/dashboard/lib/format.ts) ----------------
+// ---- tiny helpers --------------------------------------------------------
 
 export function escapeHtml(s: string | null | undefined): string {
   if (s == null) return '';
@@ -31,6 +40,15 @@ export function escapeHtml(s: string | null | undefined): string {
 function numFmt(n: number | null | undefined): string {
   const v = Math.round(Number(n) || 0);
   return v.toLocaleString('en-US');
+}
+
+/** Compact "12.3k" / "1.2M" formatter for headline numbers. */
+function kFmt(n: number | null | undefined): string {
+  const v = Number(n) || 0;
+  const a = Math.abs(v);
+  if (a >= 1_000_000) return (v / 1_000_000).toFixed(a >= 10_000_000 ? 0 : 1) + 'M';
+  if (a >= 1000) return (v / 1000).toFixed(a >= 100_000 ? 0 : 1) + 'k';
+  return String(Math.round(v));
 }
 
 function formatDuration(s: number): string {
@@ -47,40 +65,38 @@ function shortPath(p: string | null | undefined): string {
   return parts[parts.length - 1] || p;
 }
 
-// ---- compression toggle + passthrough banner -----------------------------
+// ---- compression toggle (kill switch) + passthrough banner ----------------
 
 export function renderToggleFragment(enabled: boolean): string {
+  // NOTE: the literal strings "PASSTHROUGH MODE", "Disable compression" and
+  // "Enable compression" are asserted by tests — keep them.
   const banner = enabled
     ? ''
-    : `<div class="banner"><strong>PASSTHROUGH MODE</strong> - compression disabled. Every /v1/messages forwards unchanged to upstream. No image encoding, no break-even gate, no transforms.</div>`;
-  // The button POSTs the OPPOSITE of the rendered state - the fragment is
-  // re-rendered with fresh state on every poll, so the value can't go stale
-  // (the legacy UI read state out of the button label; the Svelte UI carried
-  // it in a store; here the server just bakes it into the markup).
+    : `<div class="banner"><strong>PASSTHROUGH MODE</strong> — compression is off. Every request goes to Claude unchanged: no images, no savings. Use this to A/B test, or if the upstream API is having problems.</div>`;
+  // The button POSTs the OPPOSITE of the rendered state; every 2s poll
+  // re-renders it with fresh server state, so the value can't go stale.
   const confirm = enabled
-    ? ` hx-confirm="Disable compression?\n\n/v1/messages will forward unchanged to upstream. Use this when upstream is unhealthy or to A/B test the proxy. Restart resets to enabled."`
+    ? ` hx-confirm="Turn compression off?\n\nRequests will pass straight through to Claude, unchanged. Restarting the proxy turns it back on."`
     : '';
   return (
     banner +
-    `<div class="toggle-wrap">` +
-    `<button class="toggle" type="button" hx-post="/fragments/toggle" hx-target="#frag-toggle" hx-vals='{"enabled": ${!enabled}}'${confirm}>` +
+    `<div class="switch">` +
+    `<span class="switch-state ${enabled ? 'on' : 'off'}"><span class="switch-dot"></span>${enabled ? 'Compression on' : 'Compression off'}</span>` +
+    `<button class="switch-btn" type="button" hx-post="/fragments/toggle" hx-target="#frag-toggle" hx-vals='{"enabled": ${!enabled}}'${confirm}>` +
     (enabled ? 'Disable compression' : 'Enable compression') +
     `</button>` +
-    `<span class="hint">runtime kill switch &middot; not persisted across restart</span>` +
+    `<span class="hint">kill switch · resets to on when you restart</span>` +
     `</div>`
   );
 }
 
 // ---- compress scope (which models get imaged) ----------------------------
 
-/** Convenience catalog of common Anthropic models shown as chips by default.
- *  NOT exhaustive and NOT a gate — the chip set is the UNION of this catalog,
- *  the env-configured scope (`PXPIPE_MODELS` or the Fable-only default), and
- *  whatever is currently active, so any model the env var can enable stays
- *  toggleable. Fable 5 reads renders cleanly; Opus 4.8/4.7 read imaged content
- *  at a tax (see FINDINGS.md); Sonnet/Haiku read-fidelity is unvalidated — the
- *  catalog just makes them one click, it does not endorse them. Labels are
- *  cosmetic; an id not in the catalog renders with the raw id as its label. */
+/** Common models shown as one-click chips. NOT a gate — the chip set is the
+ *  UNION of this catalog, the env-configured scope, and whatever is active, so
+ *  any model the env var enables stays toggleable. Fable 5 reads renders
+ *  cleanly; Opus reads them at a tax; Sonnet/Haiku are unvalidated. Labels are
+ *  cosmetic. */
 const MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'claude-fable-5', label: 'Fable 5' },
   { id: 'claude-opus-4-8', label: 'Opus 4.8' },
@@ -89,12 +105,6 @@ const MODEL_CATALOG: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'claude-haiku-4-5', label: 'Haiku 4.5' },
 ];
 
-/** "compress models" chips. The chip set is the UNION of MODEL_CATALOG, the
- *  env-configured scope (`configured`, from PXPIPE_MODELS or the Fable-only
- *  default), and the currently-active scope (`active`) — so a model enabled via
- *  the env var is always shown and can be toggled off AND back on (it no longer
- *  vanishes once it leaves the active set). `active` lights the chip; every chip
- *  routes through the same /fragments/models toggle. */
 export function renderModelsFragment(
   active: string[],
   configured: string[],
@@ -117,24 +127,224 @@ export function renderModelsFragment(
       return (
         `<button class="chip${lit ? ' on' : ''}" type="button" ` +
         `hx-post="/fragments/models" hx-target="#frag-models" ` +
-        `hx-vals='{"model":"${id}","on":${!lit}}'>${label}${lit ? ' ✓' : ''}</button>`
+        `hx-vals='{"model":"${id}","on":${!lit}}'>${escapeHtml(label)}${lit ? ' ✓' : ''}</button>`
       );
     })
     .join('');
-  const moot = enabled ? '' : ` <span class="hint">compression off &middot; scope moot</span>`;
+  const moot = enabled ? '' : ` <span class="hint">compression is off, so this has no effect right now</span>`;
   return (
-    `<div class="models-wrap">` +
-    `<span class="models-label">compress models</span>` +
+    `<div class="models">` +
+    `<span class="models-label">Only image these models</span>` +
     chips +
-    `<span class="hint">click to toggle &middot; runtime only, not persisted</span>${moot}` +
+    `<span class="hint">everything else is sent as normal text · runtime only, not saved</span>${moot}` +
     `</div>`
   );
 }
 
-// ---- context map (how this request's context was transformed) -------------
+// ---- the layered hero: one plain-language answer --------------------------
+
+// MUST stay in lockstep with the server-side ASSUMED_INPUT_USD_PER_MTOK in
+// src/dashboard.ts (see that constant's comment for the rate rationale).
+const INPUT_USD_PER_MTOK = 10.0;
+// Referenced so the constant isn't flagged unused; the dashboard does its own
+// dollar conversion in renderHeaderFragment from the server's pricing block.
+void INPUT_USD_PER_MTOK;
+
+export function renderSessionSummaryFragment(data: CurrentSessionPayload): string {
+  const measured = data.baselineMeasuredCount ?? 0;
+  if (measured <= 0) {
+    return (
+      `<div class="hero hero-empty">` +
+      `<div class="hero-eyebrow">This session</div>` +
+      `<div class="hero-headline">Warming up…</div>` +
+      `<div class="hero-sub">Point Claude Code at this proxy and send a message. The moment a request flows through, your live savings show up right here.</div>` +
+      `</div>`
+    );
+  }
+  // HEADLINE: raw, rate-free TOTAL token reduction (input + output), real
+  // server numbers, one division. Output isn't compressed, so it's added to
+  // BOTH sides (headlining input-only would cherry-pick).
+  const rawActual = data.rawActualTokens ?? 0; // input side, real (in+cc+cr)
+  const rawBaseline = data.rawBaselineTokens ?? 0; // input side, as text (count_tokens)
+  const rawOutput = data.rawOutputTokens ?? 0; // reply (same both sides)
+  const ppTotal = rawActual + rawOutput;
+  const textTotal = rawBaseline + rawOutput;
+  const totalPct = textTotal > 0 ? (1 - ppTotal / textTotal) * 100 : 0;
+  const inputPct = rawBaseline > 0 ? (1 - rawActual / rawBaseline) * 100 : 0;
+  const positive = totalPct >= 0;
+  const bigNum = `${Math.abs(totalPct).toFixed(0)}%`;
+  const word = positive ? 'fewer tokens' : 'more tokens';
+
+  return (
+    `<div class="hero${positive ? '' : ' hero-neg'}">` +
+    `<div class="hero-eyebrow">This session · ${measured} request${measured === 1 ? '' : 's'}</div>` +
+    `<div class="hero-headline"><span class="hero-num">${bigNum}</span> ${word} sent to Claude</div>` +
+    `<div class="hero-sub">` +
+    `<strong>${kFmt(ppTotal)}</strong> tokens actually sent vs <strong>${kFmt(textTotal)}</strong> if it were all plain text. ` +
+    `Your messages and Claude's replies are never compressed.` +
+    `</div>` +
+    `<div class="hero-meta">` +
+    `Input context compressed <b class="${inputPct >= 0 ? 'good' : 'bad'}">${inputPct.toFixed(0)}%</b> ` +
+    `(${kFmt(rawActual)} vs ${kFmt(rawBaseline)} as text) · ` +
+    `output untouched (${kFmt(rawOutput)}) · no pricing assumptions` +
+    `</div>` +
+    `</div>`
+  );
+}
+
+// ---- supporting stats + the single "Show the math" drawer ------------------
+
+function mathRow(key: string, val: number | string | undefined, note = ''): string {
+  const v = typeof val === 'number' ? numFmt(val) : String(val ?? '-');
+  return `<div><span class="k">${key}:</span> <span class="v">${escapeHtml(v)}</span> <span class="k">${note}</span></div>`;
+}
+
+function mathBlock(title: string, body: string): string {
+  return `<section class="math-block"><h4>${title}</h4><div class="formula">${body}</div></section>`;
+}
+
+/** One supporting stat tile. `tip` (optional) adds a hover "?" explainer so a
+ *  newcomer gets plain language without the math drawer. */
+function statTile(
+  label: string,
+  value: string,
+  sub: string,
+  cls = '',
+  tip = '',
+): string {
+  const t = tip ? ` title="${escapeHtml(tip)}"` : '';
+  const q = tip ? `<span class="q">?</span>` : '';
+  return (
+    `<div class="tile"${t}>` +
+    `<div class="tile-label">${label}${q}</div>` +
+    `<div class="tile-value ${cls}">${value}</div>` +
+    `<div class="tile-sub">${sub}</div>` +
+    `</div>`
+  );
+}
+
+export function renderHeaderFragment(s: StatsPayload, port: number): string {
+  const pa = s.pricing_assumptions;
+
+  // --- the supporting stat strip (plain language, with hover tooltips) ---
+  const splitReady = s.split_sufficient_sample;
+  const cAvg = s.compressed_avg_usd_per_request ?? 0;
+  const pAvg = s.passthrough_avg_usd_per_request ?? 0;
+  const costTile = splitReady
+    ? statTile(
+        'Cost per request',
+        `$${cAvg.toFixed(4)}`,
+        `vs $${pAvg.toFixed(4)} without pxpipe`,
+        cAvg <= pAvg ? 'pos' : 'neg',
+        'Average real cost of a request with imaging on vs off (passthrough), measured on your own traffic.',
+      )
+    : statTile(
+        'Cost per request',
+        'collecting…',
+        `${numFmt(s.compressed_paid_requests)} imaged · ${numFmt(s.passthrough_paid_requests)} passthrough so far`,
+        'muted-val',
+        `Needs at least ${s.split_min_sample_per_bucket} paid requests on each path before the comparison is trustworthy.`,
+      );
+
+  const strip =
+    `<div class="strip">` +
+    statTile('Requests', numFmt(s.requests), `${numFmt(s.compressed_requests)} turned into images`) +
+    statTile(
+      'Input tokens saved',
+      numFmt(s.saved_input_tokens),
+      'vs sending the same context as text',
+      'pos',
+      'Bulky context (system prompt, tool output, old turns) sent as compact images instead of text. Cache-aware, input side only — your replies are never compressed.',
+    ) +
+    statTile(
+      'Estimated saved',
+      `$${(s.saved_usd ?? 0).toFixed(2)}`,
+      `at $${pa.input_per_mtok}/M input tokens`,
+      '',
+      'A rough dollar figure: saved tokens × the input price. Actual savings depend on your plan and caching — see the math drawer.',
+    ) +
+    costTile +
+    `</div>`;
+
+  // --- the math drawer: every formula + honesty caveat, one click away ----
+  const savedMath =
+    `<div><span class="k">formula:</span> <span class="v">saved = baseline − actual</span></div>` +
+    `<div><span class="k">weights:</span> <span class="v">input×1.0, cache_create×1.25, cache_read×0.10</span></div>` +
+    `<div class="sp"></div>` +
+    mathRow('baseline', s.baseline_input_weighted, '(cache-aware: cacheable×weight + cold_tail)') +
+    mathRow('actual', s.actual_input_weighted, '(input + cc×1.25 + cr×0.10 from usage)') +
+    mathRow('saved', s.saved_input_tokens, `<span class="op">=</span> baseline − actual`) +
+    `<span class="src">output excluded — identical with/without compression</span>`;
+
+  const usdMath =
+    `<div><span class="k">formula:</span> <span class="v">$ saved = saved_tokens × $${pa.input_per_mtok}/Mtok</span></div>` +
+    `<div class="sp"></div>` +
+    mathRow('saved_tokens', s.saved_input_tokens, '(cache-aware, input-side)') +
+    mathRow('saved_usd', `$${(s.saved_usd || 0).toFixed(4)} `, `<span class="op">=</span> saved_tokens × input_rate / 1e6`) +
+    `<span class="src">source: ${escapeHtml(pa.source || 'docs.anthropic.com pricing')}</span>`;
+
+  const splitMath =
+    `<div><span class="k">formula:</span> <span class="v">bucket_$ = (Σ actual_input + Σ output × ${pa.output_multiplier}) × $${pa.input_per_mtok}/Mtok</span></div>` +
+    `<div><span class="k">why:</span> <span class="v">partition the paid-rows set by which path actually ran (compressed vs passthrough). Same $/Mtok on both sides so the rate assumption cancels in the delta. Selection bias (the gate routes each turn) does NOT cancel — read with the sample counts.</span></div>` +
+    `<div class="sp"></div>` +
+    mathRow(`compressed (n=${s.compressed_paid_requests})`, `$${(s.compressed_actual_usd || 0).toFixed(4)}`, `total · avg $${(s.compressed_avg_usd_per_request || 0).toFixed(4)}/req`) +
+    mathRow(`passthrough (n=${s.passthrough_paid_requests})`, `$${(s.passthrough_actual_usd || 0).toFixed(4)}`, `total · avg $${(s.passthrough_avg_usd_per_request || 0).toFixed(4)}/req`) +
+    mathRow(
+      'compressed − passthrough',
+      `$${(s.compressed_minus_passthrough_avg_usd || 0).toFixed(4)}/req`,
+      s.split_sufficient_sample
+        ? `(both buckets ≥ ${s.split_min_sample_per_bucket} — delta is meaningful)`
+        : `(small sample: need ≥ ${s.split_min_sample_per_bucket} per bucket; treat as noisy)`,
+    ) +
+    `<span class="src">no counterfactual, no probe gate — pure observed $/req on each path</span>`;
+
+  const pctMath =
+    `<div><span class="k">formula:</span> <span class="v">share_of_spend = saved / (all_baseline_equivalent + all_output × ${pa.output_multiplier})</span></div>` +
+    `<div><span class="k">diagnostic, not the headline:</span> <span class="v">this is a counterfactual ("what you WOULD have paid"). It leans on the count_tokens probe, the cache-aware split, and an input-rate assumption. Useful as a sanity check; the real-traffic answer is the compressed-vs-passthrough split above.</span></div>` +
+    `<div class="sp"></div>` +
+    mathRow('saved', s.saved_input_tokens, '(measured-rows numerator; cache-aware)') +
+    mathRow('all_baseline_equivalent', s.all_baseline_equivalent_weighted, '(every paid request; baseline on measured + actual on the rest)') +
+    mathRow(`all_output × ${pa.output_multiplier}`, s.all_output_weighted, '(every paid request)') +
+    mathRow('share_of_spend', (s.saved_pct_of_all_spend || 0).toFixed(1) + '%', `<span class="op">=</span> saved / counterfactual_total × 100`) +
+    mathRow('all_usage_requests', s.all_usage_requests, '(denominator request count — compressed + passthrough + probe-failed)') +
+    `<span class="src">measured numerator, all-rows counterfactual denominator — bounded at 100%</span>`;
+
+  const tokeqMath =
+    `<div><span class="k">formula:</span> <span class="v">token_equivalent = input + output × ${pa.output_multiplier}</span></div>` +
+    `<div><span class="k">why:</span> <span class="v">matches Anthropic's per-Mtok price ratio ($${pa.input_per_mtok} input vs $${pa.input_per_mtok * pa.output_multiplier} output) — this is what the weekly-limit meter counts.</span></div>` +
+    `<div class="sp"></div>` +
+    mathRow('actual_token_equivalent', s.actual_token_equivalent) +
+    mathRow('baseline_token_equivalent', s.baseline_token_equivalent, `(unproxied counterfactual, same ×${pa.output_multiplier} on output)`) +
+    `<div class="sp"></div>` +
+    mathRow('events_with_measurement', s.events_with_measurement, '(events where the SSE/JSON scanner produced char counts)') +
+    mathRow('measured_text_chars', s.measured_text_chars, '') +
+    mathRow('measured_thinking_chars', s.measured_thinking_chars, '') +
+    mathRow('measured_tool_use_chars', s.measured_tool_use_chars, '') +
+    mathRow('measured_redacted_blocks', s.measured_redacted_block_count, '(opaque encrypted blocks — billed but unmeasurable)') +
+    `<span class="src">measured — no estimation</span>`;
+
+  const drawer =
+    `<details class="drawer" id="math-drawer">` +
+    `<summary>Show the math &amp; honesty receipts</summary>` +
+    `<div class="drawer-intro">Every number above, derived from the same per-event log. The proxy only moves <em>input</em> tokens; output is shown on both sides so percentages stay honest.</div>` +
+    `<div class="math-grid">` +
+    mathBlock('Input tokens saved', savedMath) +
+    mathBlock('Dollars saved', usdMath) +
+    mathBlock('Compressed vs passthrough, per request', splitMath) +
+    mathBlock('Share of total spend (diagnostic)', pctMath) +
+    mathBlock('Token-equivalent (what the weekly cap counts)', tokeqMath) +
+    `</div></details>`;
+
+  // The port is surfaced here (tests assert the header fragment contains it).
+  const updated = `<div class="updated"><span class="live-dot"></span>live · port ${port} · uptime ${formatDuration(s.uptime_sec)}</div>`;
+
+  return strip + drawer + updated;
+}
+
+// ---- request "x-ray": which parts became images vs stayed text ------------
 
 export interface ContextMapData {
-  id: number; // first image id for this request (matches the recent-table view link)
+  id: number; // first image id for this request (matches the recent-table link)
   baselineTokens: number; // count_tokens of the body as text
   realInput: number; // input + cache_create + cache_read (server-measured)
   output: number;
@@ -145,210 +355,79 @@ export interface ContextMapData {
 }
 
 const CTXMAP_BUCKETS: ReadonlyArray<readonly [string, string]> = [
-  ['static_slab', 'static slab (system + tools + CLAUDE.md)'],
-  ['reminder', 'system-reminder blocks'],
-  ['tool_result_prose', 'tool results — prose'],
-  ['tool_result_log', 'tool results — logs'],
-  ['tool_result_json', 'tool results — JSON'],
-  ['history', 'collapsed history'],
+  ['static_slab', 'System prompt + tool docs'],
+  ['reminder', 'System-reminder blocks'],
+  ['tool_result_prose', 'Tool results — prose'],
+  ['tool_result_log', 'Tool results — logs'],
+  ['tool_result_json', 'Tool results — JSON'],
+  ['history', 'Older conversation turns'],
 ];
 
-/** "How your context works" panel for the latest request: real token flow
- *  (as-text -> real) plus the exact-char breakdown of what became images. Real
- *  tokens are the server's count; per-row chars are exact pre-render. No cpt
- *  guesswork — headline in tokens, breakdown in chars. */
+/** The image-vs-text breakdown for one request: real token flow plus an exact
+ *  split of what became images (lossy) vs what stayed text (byte-exact). */
 export function renderContextMapFragment(
   c: ContextMapData | undefined,
   history: ContextMapData[] = [],
   notFound = false,
 ): string {
-  const k = (n: number): string =>
-    n >= 1000 ? (n / 1000).toFixed(n >= 100_000 ? 0 : 1) + 'k' : String(Math.round(n));
   const isLatest = c !== undefined && c.id === (history.at(-1)?.id ?? -1);
   if (notFound) {
-    return `<div class="ctxmap"><div class="hint">That request's context breakdown is no longer available — it was evicted (only the most recent requests are kept) or had no token usage recorded. Click <strong>view</strong> on a more recent row.</div></div>`;
+    return `<div class="ctxmap"><div class="empty-note">That request's breakdown isn't kept anymore — only the most recent requests are. Pick <strong>Details</strong> on a newer row.</div></div>`;
   }
   if (!c || (c.baselineTokens <= 0 && c.imageCount <= 0)) {
-    return `<div class="ctxmap"><div class="hint">Click <strong>view</strong> on a request above to see how its context was transformed.</div></div>`;
+    return `<div class="ctxmap"><div class="empty-note">Pick <strong>Details</strong> on a request to see exactly which parts became images and which stayed as text.</div></div>`;
   }
   const base = c.baselineTokens;
   const real = c.realInput;
   const pct = base > 0 ? Math.round((1 - real / base) * 100) : 0;
-  const rows = CTXMAP_BUCKETS.map(([key, label]) => [label, c.buckets[key] ?? 0] as const)
+  const totalImagedChars = CTXMAP_BUCKETS.reduce((a, [key]) => a + (c.buckets[key] ?? 0), 0);
+
+  const imgRows = CTXMAP_BUCKETS.map(([key, label]) => [label, c.buckets[key] ?? 0] as const)
     .filter(([, ch]) => ch > 0)
     .map(
       ([label, ch]) =>
-        `<div class="ctxmap-row"><span class="ctxmap-lbl">${label}</span><span class="ctxmap-val">${k(ch)} chars</span></div>`,
+        `<div class="ctx-row"><span class="ctx-lbl">${label}</span><span class="ctx-val">${kFmt(ch)} chars</span></div>`,
     )
     .join('');
-  const head =
-    base > 0
-      ? `${k(base)} tok as text &rarr; <strong>${k(real)} tok real</strong> &middot; <span class="ctxmap-pct">&minus;${pct}%</span>`
-      : `<strong>${k(real)} tok real</strong>`;
-  const title = isLatest ? 'CONTEXT BREAKDOWN — latest' : 'CONTEXT BREAKDOWN — selected request';
+
   const ids = c.imageIds ?? [];
   const gallery = ids.length
-    ? `<div class="ctxmap-imgs-title">${ids.length} rendered page${ids.length === 1 ? '' : 's'} sent to the model (scroll):</div>` +
-      `<div class="ctxmap-imgs">` +
+    ? `<div class="pages-title">${ids.length} image page${ids.length === 1 ? '' : 's'} sent to Claude — click one to read the exact text behind it:</div>` +
+      `<div class="pages">` +
       ids
         .map(
           (id) =>
-            `<img class="ctxmap-img" src="/proxy-latest-png?id=${id}" alt="page ${id}" loading="lazy" title="page ${id}" onerror="this.classList.add('img-gone'); this.alt='page ${id} evicted from buffer';" />`,
+            `<img class="page" src="/proxy-latest-png?id=${id}" alt="page ${id}" loading="lazy" title="Click to read the source text behind page ${id}" onclick="ppPin(${id});ppSource(true)" onerror="this.classList.add('page-gone'); this.alt='page ${id} expired from buffer';" />`,
         )
         .join('') +
       `</div>`
     : '';
+
+  const headline =
+    base > 0
+      ? `<span class="ctx-big">${pct}%</span> smaller — <strong>${kFmt(base)}</strong> tokens as plain text became <strong>${kFmt(real)}</strong> tokens actually sent`
+      : `<strong>${kFmt(real)}</strong> tokens sent`;
+  const title = isLatest ? 'Latest request' : 'Selected request';
+
   return (
     `<div class="ctxmap">` +
-    `<div class="ctxmap-head"><strong>${title}</strong> &middot; ${head} &middot; ${c.imageCount} image page${c.imageCount === 1 ? '' : 's'}</div>` +
-    `<div class="ctxmap-sub">became images — exact chars rendered to PNG (pxpipe is lossy on these):</div>` +
-    (rows || `<div class="ctxmap-row hint">nothing imaged this request</div>`) +
-    `<div class="ctxmap-foot hint">headline tokens are the server's real count (input + cache); per-row values are exact pre-render chars. Output (${k(c.output)} tok) is never imaged.</div>` +
+    `<div class="ctx-headline"><span class="ctx-title">${title}</span> ${headline}</div>` +
+    `<div class="legend"><span class="tag tag-img">Became an image</span><span class="tag tag-txt">Stayed as text</span></div>` +
+    `<div class="split">` +
+    `<div class="split-col split-img">` +
+    `<div class="split-head">Compressed into images <span class="split-sum">${kFmt(totalImagedChars)} chars · ${c.imageCount} page${c.imageCount === 1 ? '' : 's'}</span></div>` +
+    (imgRows || `<div class="ctx-row muted-row">nothing imaged this request</div>`) +
+    `<div class="split-note">pxpipe can misread exact values inside images — treat these as gist, not byte-exact.</div>` +
+    `</div>` +
+    `<div class="split-col split-txt">` +
+    `<div class="split-head">Kept as plain text <span class="split-sum">byte-exact</span></div>` +
+    `<div class="ctx-row"><span class="ctx-lbl">Your latest messages</span><span class="ctx-val">verbatim</span></div>` +
+    `<div class="ctx-row"><span class="ctx-lbl">Claude's reply (output)</span><span class="ctx-val">${kFmt(c.output)} tok</span></div>` +
+    `<div class="split-note">never imaged — safe for IDs, hashes and exact numbers.</div>` +
+    `</div>` +
+    `</div>` +
     gallery +
     `</div>`
-  );
-}
-
-// ---- current-session headline --------------------------------------------
-
-// MUST stay in lockstep with the server-side `ASSUMED_INPUT_USD_PER_MTOK`
-// in src/dashboard.ts (see that constant's comment for the rate rationale).
-const INPUT_USD_PER_MTOK = 10.0;
-
-export function renderSessionSummaryFragment(data: CurrentSessionPayload): string {
-  const measured = data.baselineMeasuredCount ?? 0;
-  if (measured <= 0) return '';
-  // HEADLINE: raw, rate-free TOTAL token reduction (input + output), real server
-  // numbers, one division — no rate weighting. Output isn't compressed, so it's
-  // added to BOTH sides (headlining input-only would cherry-pick).
-  const rawActual = data.rawActualTokens ?? 0;       // input side, real (in+cc+cr)
-  const rawBaseline = data.rawBaselineTokens ?? 0;   // input side, as text (count_tokens)
-  const rawOutput = data.rawOutputTokens ?? 0;       // reply (same both sides, uncompressed)
-  const ppTotal = rawActual + rawOutput;
-  const textTotal = rawBaseline + rawOutput;
-  const totalPct = textTotal > 0 ? (1 - ppTotal / textTotal) * 100 : 0;
-  // Honest sign: pxpipe can cost MORE on a session (cc-heavy turns, or the
-  // passthrough control), so phrase a negative as "more tokens" rather than
-  // render a garbled "-7% fewer tokens".
-  const totalLabel =
-    totalPct >= 0 ? `${totalPct.toFixed(0)}% fewer tokens` : `${(-totalPct).toFixed(0)}% more tokens`;
-  const inputPct = rawBaseline > 0 ? (1 - rawActual / rawBaseline) * 100 : 0;
-  const k = (t: number) => `${(t / 1000).toFixed(0)}k`;
-  return (
-    `<div class="line">` +
-    `<span class="label">THIS SESSION</span>` +
-    ` &mdash; <span class="num">${totalLabel}</span>` +
-    ` (<span class="num">${k(ppTotal)}</span> vs <span class="muted">${k(textTotal)}</span> total)` +
-    ` &mdash; <span class="muted">${measured} requests</span>` +
-    `</div>` +
-    `<div class="line"><span class="small muted">` +
-    `total = input + output, real server tokens. input compressed <b>${inputPct.toFixed(0)}%</b> ` +
-    `(${k(rawActual)} vs ${k(rawBaseline)} as text); output <b>not</b> compressed (${k(rawOutput)}, same both sides). ` +
-    `No rates, no assumptions &mdash; what it saves in $ depends on pricing; weekly-cap weight unknown.` +
-    `</span></div>`
-  );
-}
-
-// ---- stats header: sub-line + savings cards + diagnostic ------------------
-
-function mathRow(key: string, val: number | string | undefined, note = ''): string {
-  const v = typeof val === 'number' ? numFmt(val) : String(val ?? '-');
-  return `<div><span class="k">${key}:</span> <span class="v">${escapeHtml(v)}</span> <span class="k">${note}</span></div>`;
-}
-
-// `id` keeps <details> open state across htmx swaps (see glue script in the
-// page shell - open ids are recorded before swap and restored after).
-function details(id: string, summary: string, body: string, cls = 'math'): string {
-  return `<details class="${cls}" id="${id}"><summary>${summary}</summary><div class="formula">${body}</div></details>`;
-}
-
-export function renderHeaderFragment(s: StatsPayload, port: number): string {
-  const pa = s.pricing_assumptions;
-  const sub = `port ${port} &middot; uptime ${formatDuration(s.uptime_sec)} &middot; live`;
-
-  const savedMath =
-    `<div><span class="k">formula:</span> <span class="v">saved = baseline - actual</span></div>` +
-    `<div><span class="k">weights:</span> <span class="v">input&times;1.0, cache_create&times;1.25, cache_read&times;0.10</span></div>` +
-    `<div style="height:6px"></div>` +
-    mathRow('baseline', s.baseline_input_weighted, '(cache-aware: cacheable&times;weight + cold_tail)') +
-    mathRow('actual', s.actual_input_weighted, '(input + cc&times;1.25 + cr&times;0.10 from usage)') +
-    mathRow('saved', s.saved_input_tokens, `<span class="op">=</span> baseline - actual`) +
-    `<span class="src">output excluded - identical with/without compression</span>`;
-
-  const usdMath =
-    `<div><span class="k">formula:</span> <span class="v">$ saved = saved_tokens &times; $${pa.input_per_mtok}/Mtok</span></div>` +
-    `<div style="height:6px"></div>` +
-    mathRow('saved_tokens', s.saved_input_tokens, '(cache-aware, input-side)') +
-    mathRow('saved_usd', `$${(s.saved_usd || 0).toFixed(4)} `, `<span class="op">=</span> saved_tokens &times; input_rate / 1e6`) +
-    `<span class="src">source: ${escapeHtml(pa.source || 'docs.anthropic.com pricing')}</span>`;
-
-  const splitMath =
-    `<div><span class="k">formula:</span> <span class="v">bucket_$ = (&Sigma; actual_input + &Sigma; output &times; ${pa.output_multiplier}) &times; $${pa.input_per_mtok}/Mtok</span></div>` +
-    `<div><span class="k">why:</span> <span class="v">partition the paid-rows set by which path actually ran this turn (\`info.compressed = true\` for slab/history compression; false for passthrough or bypassed). Same $/Mtok rate on both sides so the rate-assumption bias cancels in the delta. Selection bias (the gate routes each turn) does NOT cancel - interpret with sample counts.</span></div>` +
-    `<div style="height:6px"></div>` +
-    mathRow(`compressed (n=${s.compressed_paid_requests})`, `$${(s.compressed_actual_usd || 0).toFixed(4)}`, `total &middot; avg $${(s.compressed_avg_usd_per_request || 0).toFixed(4)}/req`) +
-    mathRow(`passthrough (n=${s.passthrough_paid_requests})`, `$${(s.passthrough_actual_usd || 0).toFixed(4)}`, `total &middot; avg $${(s.passthrough_avg_usd_per_request || 0).toFixed(4)}/req`) +
-    mathRow(
-      'compressed - passthrough',
-      `$${(s.compressed_minus_passthrough_avg_usd || 0).toFixed(4)}/req`,
-      s.split_sufficient_sample
-        ? `(both buckets &ge; ${s.split_min_sample_per_bucket} - delta is meaningful)`
-        : `(small sample: need &ge; ${s.split_min_sample_per_bucket} per bucket; treat delta as noisy)`,
-    ) +
-    `<span class="src">no counterfactual, no probe gate - pure observed $/req on each path</span>`;
-
-  const tokeqMath =
-    `<div><span class="k">formula:</span> <span class="v">token_equivalent = input + output &times; ${pa.output_multiplier}</span></div>` +
-    `<div><span class="k">why:</span> <span class="v">matches Anthropic's per-Mtok price ratio ($${pa.input_per_mtok} input vs $${pa.input_per_mtok * pa.output_multiplier} output)</span></div>` +
-    `<div style="height:6px"></div>` +
-    mathRow('actual_input', s.actual_input_weighted, '(weighted upstream usage)') +
-    mathRow('actual_token_equivalent', s.actual_token_equivalent) +
-    mathRow('baseline_token_equivalent', s.baseline_token_equivalent, `(unproxied counterfactual, same &times;${pa.output_multiplier} on output)`) +
-    `<div style="height:6px"></div>` +
-    mathRow('events_with_measurement', s.events_with_measurement, '(events where SSE/JSON scanner produced char counts)') +
-    mathRow('measured_text_chars', s.measured_text_chars, '(content_block_delta &middot; text_delta + response content[].text)') +
-    mathRow('measured_thinking_chars', s.measured_thinking_chars, '(content_block_delta &middot; thinking_delta + response reasoning text)') +
-    mathRow('measured_tool_use_chars', s.measured_tool_use_chars, '(content_block_delta &middot; input_json_delta + tool_use blocks)') +
-    mathRow('measured_redacted_blocks', s.measured_redacted_block_count, '(opaque encrypted blocks - chars unavailable, billed but unmeasurable)') +
-    `<span class="src">measured - no estimation</span>`;
-
-  const pctMath =
-    `<div><span class="k">formula:</span> <span class="v">share_of_spend = saved / (all_baseline_equivalent + all_output &times; ${pa.output_multiplier})</span></div>` +
-    `<div><span class="k">why this is diagnostic, not the headline:</span> <span class="v">this is a counterfactual ("what the user WOULD have paid"). It depends on the count_tokens probe, the cache-aware baseline split, and an input-rate assumption. Useful as a sanity check, but the operator's real question is "did the compressed path cost less per request than the passthrough path on real traffic" - that's the headline split above, no counterfactuals.</span></div>` +
-    `<div style="height:6px"></div>` +
-    mathRow('saved', s.saved_input_tokens, '(measured-rows numerator; cache-aware)') +
-    mathRow('all_baseline_equivalent', s.all_baseline_equivalent_weighted, '(every paid request, weighted; baseline on measured + actual on the rest)') +
-    mathRow(`all_output &times; ${pa.output_multiplier}`, s.all_output_weighted, `(every paid request, output &times; ${pa.output_multiplier})`) +
-    mathRow('all_counterfactual_total', s.all_baseline_equivalent_weighted + s.all_output_weighted, `<span class="op">=</span> all_baseline_equivalent + all_output`) +
-    mathRow('share_of_spend', (s.saved_pct_of_all_spend || 0).toFixed(1) + '%', `<span class="op">=</span> saved / all_counterfactual_total &times; 100`) +
-    mathRow('all_usage_requests', s.all_usage_requests, '(denominator request count - compressed + passthrough + probe-failed)') +
-    `<span class="src">measured numerator, all-rows counterfactual denominator - bounded at 100%</span>`;
-
-  const delta = s.compressed_minus_passthrough_avg_usd ?? 0;
-  const splitCard = s.split_sufficient_sample
-    ? `<div class="value ${delta <= 0 ? 'pos' : 'neg'}">${delta >= 0 ? '+$ ' : '-$ '}${Math.abs(delta).toFixed(4)}</div>` +
-      `<div class="small">negative = compressed path cheaper &middot; both buckets &ge; ${s.split_min_sample_per_bucket}</div>`
-    : `<div class="value small-sample">small sample</div>` +
-      `<div class="small">need &ge; ${s.split_min_sample_per_bucket} requests per bucket &middot; have ${numFmt(s.compressed_paid_requests)} / ${numFmt(s.passthrough_paid_requests)}</div>`;
-
-  return (
-    `<div class="sub">${sub}</div>` +
-    `<div class="grid">` +
-    `<div class="card"><div class="label">requests</div><div class="value">${numFmt(s.requests)}</div><div class="small">&mdash; ${numFmt(s.compressed_requests)} compressed</div></div>` +
-    `<div class="card"><div class="label">input tokens saved</div><div class="value pos">${numFmt(s.saved_input_tokens)}</div><div class="small">cache-aware, input-side only</div>${details('math-saved', 'show calculation', savedMath)}</div>` +
-    `<div class="card"><div class="label">$ saved</div><div class="value">$ ${(s.saved_usd ?? 0).toFixed(2)}</div><div class="small">at $${pa.input_per_mtok}/M input tokens</div>${details('math-usd', 'show calculation', usdMath)}</div>` +
-    `<div class="card"><div class="label">compressed $/req</div><div class="value">$ ${(s.compressed_avg_usd_per_request ?? 0).toFixed(4)}</div><div class="small">n=${numFmt(s.compressed_paid_requests)} &middot; total $ ${(s.compressed_actual_usd ?? 0).toFixed(4)}</div></div>` +
-    `<div class="card"><div class="label">passthrough $/req</div><div class="value">$ ${(s.passthrough_avg_usd_per_request ?? 0).toFixed(4)}</div><div class="small">n=${numFmt(s.passthrough_paid_requests)} &middot; total $ ${(s.passthrough_actual_usd ?? 0).toFixed(4)}</div></div>` +
-    `<div class="card"><div class="label">compressed - passthrough $/req</div>${splitCard}${details('math-split', 'show calculation', splitMath)}</div>` +
-    `</div>` +
-    details(
-      'diag-pct',
-      'diagnostic: counterfactual "share of spend saved"',
-      `<div class="diag-headline">share of spend saved (counterfactual): <span class="${(s.saved_pct_of_all_spend ?? 0) >= 0 ? 'pos' : 'neg'}">${(s.saved_pct_of_all_spend ?? 0).toFixed(1)}%</span> <span class="small">(${numFmt(s.all_usage_requests)} paid req &middot; compressed + passthrough + probe-failed)</span></div>` +
-        pctMath,
-      'diagnostic',
-    ) +
-    details('diag-tokeq', `token-equivalent total: ${numFmt(s.actual_token_equivalent)} (input + ${pa.output_multiplier}&times;output)`, tokeqMath, 'diagnostic')
   );
 }
 
@@ -364,37 +443,49 @@ export function renderRecentFragment(p: RecentPayload): string {
   const rows = (p.recent ?? []).slice().reverse();
   const body =
     rows.length === 0
-      ? `<tr><td colspan="9" class="small" style="color:#6e7681">no requests yet</td></tr>`
+      ? `<tr><td colspan="9" class="empty-cell">No requests yet — they stream in here live.</td></tr>`
       : rows
           .map((e: RecentRow, i: number) => {
             const viewId = (e.img_ids ?? (e.img_id != null ? [e.img_id] : []))[0];
             const viewLink =
               viewId != null
-                ? `<a class="rec-view" href="#" hx-get="/fragments/context-map?req=${viewId}" hx-target="#frag-context-map" hx-swap="innerHTML">view</a>`
-                : `<span class="muted">-</span>`;
+                ? `<a class="row-view" href="#" hx-get="/fragments/context-map?req=${viewId}" hx-target="#frag-context-map" hx-swap="innerHTML">Details →</a>`
+                : `<span class="muted">—</span>`;
             const saved = e.session_saved_so_far_delta ?? 0;
+            const imaged = e.cc_added
+              ? `<span class="badge badge-img">image</span>`
+              : `<span class="badge badge-txt">text</span>`;
             return (
               `<tr>` +
-              `<td>${i + 1}</td>` +
-              `<td class="num ${statusCls(e.status)}">${e.status}</td>` +
-              `<td class="small">${escapeHtml(shortPath(e.path))}</td>` +
-              `<td class="num">${e.cc_added ? '&check;' : '-'}</td>` +
-              `<td class="num">${e.cache_read != null ? numFmt(e.cache_read) : '-'}</td>` +
-              `<td class="num">${e.baseline_input != null ? numFmt(e.baseline_input) : '-'}</td>` +
-              `<td class="num">${e.actual_input != null ? numFmt(e.actual_input) : '-'}</td>` +
-              `<td class="num pos">${saved > 0 ? '+' + numFmt(saved) : '-'}</td>` +
+              `<td class="muted">${i + 1}</td>` +
+              `<td><span class="pill pill-${statusCls(e.status)}">${e.status}</span></td>` +
+              `<td class="endp">${escapeHtml(shortPath(e.path))}</td>` +
+              `<td>${imaged}</td>` +
+              `<td class="num">${e.cache_read != null ? numFmt(e.cache_read) : '—'}</td>` +
+              `<td class="num">${e.baseline_input != null ? numFmt(e.baseline_input) : '—'}</td>` +
+              `<td class="num">${e.actual_input != null ? numFmt(e.actual_input) : '—'}</td>` +
+              `<td class="num pos">${saved > 0 ? numFmt(saved) : '—'}</td>` +
               `<td class="num">${viewLink}</td>` +
               `</tr>`
             );
           })
           .join('');
   return (
-    `<table><thead><tr><th>#</th><th class="num">status</th><th>path</th><th class="num">cc</th><th class="num">cr</th><th class="num">baseline</th><th class="num">actual</th><th class="num">saved</th><th class="num">view</th></tr></thead>` +
-    `<tbody>${body}</tbody></table>`
+    `<table class="rtable"><thead><tr>` +
+    `<th>#</th>` +
+    `<th>Result</th>` +
+    `<th>Endpoint</th>` +
+    `<th title="Was this request's context compressed into an image?">Sent as</th>` +
+    `<th class="num" title="Tokens served from Claude's cache (cheap)">Cache hits</th>` +
+    `<th class="num" title="What this context would cost as plain text">As text</th>` +
+    `<th class="num" title="What we actually sent after imaging">Sent</th>` +
+    `<th class="num" title="Tokens saved on this request">Saved</th>` +
+    `<th></th>` +
+    `</tr></thead><tbody>${body}</tbody></table>`
   );
 }
 
-// ---- latest rendered image ------------------------------------------------
+// ---- image ↔ source inspector ---------------------------------------------
 
 export interface LatestFragmentInput {
   payload: RecentPayload;
@@ -413,34 +504,48 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
   const imageIds = payload.image_ids ?? [];
   const pinnedEvicted = pin != null && !imageIds.includes(pin);
 
-  let viewer: string;
-  if (pin != null) {
-    viewer =
-      `<div class="pin-bar"><button class="back-btn" type="button" onclick="ppPin(null)">&larr; latest</button></div>` +
-      (pinnedEvicted
-        ? `<div class="evicted">(image #${pin} no longer in buffer)</div>`
-        : `<div class="preview-crop"><img src="/proxy-latest-png?id=${pin}" alt="image #${pin}" /></div>`);
-  } else if (hasPreview) {
-    viewer = `<div class="preview-crop"><img src="/proxy-latest-png?t=${encodeURIComponent(meta)}" alt="latest rendered" /></div>`;
+  // The image src — pinned id, or the latest (cache-busted by meta).
+  const imgSrc =
+    pin != null
+      ? `/proxy-latest-png?id=${pin}`
+      : `/proxy-latest-png?t=${encodeURIComponent(meta)}`;
+
+  const pinBar =
+    pin != null
+      ? `<div class="viewer-bar"><button class="mini-btn" type="button" onclick="ppPin(null)">← back to latest</button><span class="mini-label">image #${pin}</span></div>`
+      : '';
+
+  let main: string;
+  if (pin != null && pinnedEvicted) {
+    main = `<div class="evicted">image #${pin} is no longer in the buffer</div>`;
+  } else if (pin != null || hasPreview) {
+    // When the source pane is open we show the image inside the side-by-side
+    // pairing instead, so don't duplicate it here.
+    main = showSource ? '' : `<div class="frame"><img src="${imgSrc}" alt="rendered page" /></div>`;
   } else {
-    viewer = `<div class="sub">(none yet)</div>`;
+    main = `<div class="empty-note">No images yet — they appear the instant pxpipe compresses a request.</div>`;
   }
 
-  const caption = pin != null ? `image #${pin}` : meta ? escapeHtml(meta) + ' - showing top-left at native resolution' : '';
   const showBtn = pin != null ? !pinnedEvicted : hasPreview;
+  const caption =
+    pin != null ? `image #${pin}` : meta ? `${escapeHtml(meta)} · top-left at native size` : '';
   const srcBtn = showBtn
-    ? `<button class="src-btn" type="button" onclick="ppSource(${showSource ? 'false' : 'true'})">${showSource ? 'hide source text' : 'view source text'}</button>`
+    ? `<button class="mini-btn" type="button" onclick="ppSource(${showSource ? 'false' : 'true'})">${showSource ? 'hide source text' : 'show the text behind this image'}</button>`
     : '';
 
-  let srcPane = '';
+  let pane = '';
   if (showSource) {
-    srcPane =
+    pane =
       sourceText == null
-        ? `<div class="evicted">source text not captured for this image</div>`
-        : `<pre class="src-pane">${escapeHtml(sourceText)}</pre>`;
+        ? `<div class="evicted">source text wasn't captured for this image</div>`
+        : `<div class="pairing">` +
+          `<div class="pair-col"><div class="pair-head pair-img">What Claude sees · image</div><div class="frame frame-sm"><img src="${imgSrc}" alt="rendered page" /></div></div>` +
+          `<div class="pair-mid">made from ↓</div>` +
+          `<div class="pair-col"><div class="pair-head pair-txt">The original text · byte-exact</div><pre class="src-pane">${escapeHtml(sourceText)}</pre></div>` +
+          `</div>`;
   }
 
-  return `<div class="wrap">${viewer}</div><div class="small">${caption} ${srcBtn}</div>${srcPane}`;
+  return pinBar + main + `<div class="viewer-caption">${caption} ${srcBtn}</div>` + pane;
 }
 
 // ---- sessions bar chart ---------------------------------------------------
@@ -460,19 +565,19 @@ export function renderSessionsFragment(p: SessionsPayload): string {
   };
   const barPct = (v: number) => (max <= 0 || v <= 0 ? 0 : (v / max) * 100);
 
-  const status = `<div class="status">${all.length} session${all.length === 1 ? '' : 's'}</div>`;
-  if (rows.length === 0) return status + `<div class="empty">no sessions yet</div>`;
+  const status = `<div class="status">${all.length} session${all.length === 1 ? '' : 's'} tracked</div>`;
+  if (rows.length === 0) return status + `<div class="empty">No sessions yet.</div>`;
 
   const chart = rows
     .map((s) => {
       const v = s.tokensSavedEst ?? 0;
       const pct = barPct(v);
-      const fill = pct > 0 ? `<div class="fill" style="width:max(3px,${pct}%)"></div>` : '';
+      const fill = pct > 0 ? `<div class="bar-fill" style="width:max(3px,${pct}%)"></div>` : '';
       return (
         `<div class="bar-row">` +
-        `<div class="blabel" title="${escapeHtml(s.claudeCode?.projectPath || s.project || s.id)}">${escapeHtml(label(s))}</div>` +
-        `<div class="track">${fill}</div>` +
-        `<div class="bvalue${v < 0 ? ' neg' : ''}">${numFmt(v)}</div>` +
+        `<div class="bar-label" title="${escapeHtml(s.claudeCode?.projectPath || s.project || s.id)}">${escapeHtml(label(s))}</div>` +
+        `<div class="bar-track">${fill}</div>` +
+        `<div class="bar-val${v < 0 ? ' neg' : ''}">${numFmt(v)}</div>` +
         `</div>`
       );
     })
@@ -480,8 +585,8 @@ export function renderSessionsFragment(p: SessionsPayload): string {
 
   return (
     status +
-    `<div class="chart">${chart}</div>` +
-    `<div class="axis">input tokens saved (cache-aware) &middot; top ${rows.length} of ${all.length}</div>`
+    `<div class="bars">${chart}</div>` +
+    `<div class="axis">tokens saved per session (cache-aware) · top ${rows.length} of ${all.length}</div>`
   );
 }
 
@@ -489,7 +594,7 @@ export function renderSessionsFragment(p: SessionsPayload): string {
 
 export function renderStatsTableFragment(p: FullStatsPayload): string {
   if (p.error || !p.summary) {
-    return `<div class="status">${escapeHtml(p.error || 'no data')}</div><table><tbody></tbody></table>`;
+    return `<div class="status">${escapeHtml(p.error || 'no data')}</div><table class="dtable"><tbody></tbody></table>`;
   }
   const s = p.summary;
   const totalIn = (s.inputTokensTotal || 0) + (s.cacheCreateTokensTotal || 0) + (s.cacheReadTokensTotal || 0);
@@ -499,10 +604,11 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
   const charRatio =
     s.origCharsTotal > 0 ? ((s.imageBytesTotal / s.origCharsTotal) * 100).toFixed(3) + 'x' : '-';
 
+  // NOTE: the literal word "requests" is asserted by tests — keep it.
   const tr = (k: string, v: string) => `<tr><td>${k}</td><td class="num">${v}</td></tr>`;
   return (
-    `<div class="status">${numFmt(p.parsed)} events parsed</div>` +
-    `<table><tbody>` +
+    `<div class="status">${numFmt(p.parsed)} events parsed from disk</div>` +
+    `<table class="dtable"><tbody>` +
     tr('requests', numFmt(s.total)) +
     tr('2xx / 4xx / 5xx', `${numFmt(s.ok2xx)} / ${numFmt(s.err4xx)} / ${numFmt(s.err5xx)}`) +
     tr('compressed', numFmt(s.compressed)) +
@@ -510,13 +616,13 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
     tr('input tokens', numFmt(s.inputTokensTotal)) +
     tr('cache create', numFmt(s.cacheCreateTokensTotal)) +
     tr('cache read', numFmt(s.cacheReadTokensTotal)) +
-    tr('cache hit (tok)', hitRateTok) +
-    tr('cache hit (ev)', hitRateEv) +
-    tr('orig chars', numFmt(s.origCharsTotal)) +
+    tr('cache hit (by tokens)', hitRateTok) +
+    tr('cache hit (by events)', hitRateEv) +
+    tr('original chars', numFmt(s.origCharsTotal)) +
     tr('image bytes', numFmt(s.imageBytesTotal)) +
-    tr('bytes/char', charRatio) +
-    tr('latency p50/p95', `${numFmt(s.durationP50)} / ${numFmt(s.durationP95)} ms`) +
-    tr('first-byte p50/p95', `${numFmt(s.firstByteP50)} / ${numFmt(s.firstByteP95)} ms`) +
+    tr('bytes / char', charRatio) +
+    tr('latency p50 / p95', `${numFmt(s.durationP50)} / ${numFmt(s.durationP95)} ms`) +
+    tr('first-byte p50 / p95', `${numFmt(s.firstByteP50)} / ${numFmt(s.firstByteP95)} ms`) +
     `</tbody></table>`
   );
 }
@@ -524,159 +630,263 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
 // ---- page shell -------------------------------------------------------------
 
 const CSS = `
-  body { margin: 0; padding: 24px; background: #0d1117; color: #c9d1d9;
-    font: 14px/1.45 -apple-system, BlinkMacSystemFont, 'SF Mono', Menlo, monospace; }
-  h1 { font-size: 18px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.01em; }
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-    background: #3fb950; margin-right: 6px; vertical-align: middle; animation: pulse 2s infinite; }
-  @keyframes pulse { 50% { opacity: 0.4; } }
-  .sub { color: #8b949e; font-size: 12px; margin-bottom: 22px; }
-  .row { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; margin-bottom: 22px; }
-  @media (max-width: 1200px) { .row { grid-template-columns: repeat(2, 1fr); } }
-  @media (max-width: 900px) { .row { grid-template-columns: 1fr; } }
-  .panel { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
-    padding: 14px 16px; min-width: 0; }
-  .panel h2 { font-size: 13px; font-weight: 600; margin: 0 0 14px; text-transform: uppercase;
-    letter-spacing: 0.08em; color: #8b949e; }
-  .small { font-size: 11px; color: #6e7681; margin-top: 4px; }
-  .muted { color: #6e7681; }
+  :root {
+    --bg: #faf6f2; --surface: #ffffff; --surface-2: #fbf4ee;
+    --border: #efe5db; --border-strong: #e4d6c8;
+    --ink: #241f1b; --ink-2: #5d534a; --muted: #9b9189;
+    --flame: #ff5a1f; --flame-strong: #e8420a; --flame-ink: #bd3a08; --flame-tint: #fff1ea;
+    --good: #1f9d57; --good-tint: #e7f6ee; --bad: #d8483b; --bad-tint: #fcebe9; --warn: #b7791f;
+    --img: #ff5a1f; --img-ink: #bd3a08; --img-tint: #fff1ea;
+    --txt: #2f7db0; --txt-ink: #1f5f8b; --txt-tint: #e9f3fb;
+    --radius: 14px;
+    --shadow: 0 1px 2px rgba(60,35,15,.05), 0 8px 24px rgba(60,35,15,.05);
+    --mono: 'SF Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 22px 26px 64px; background: var(--bg); color: var(--ink-2);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased; }
+  b, strong { color: var(--ink); }
+  .good { color: var(--good); } .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
 
-  /* toggle */
-  .banner { display: inline-block; margin: 8px 0; padding: 10px 14px; background: #21262d;
-    border: 1px solid #f85149; border-radius: 6px; color: #f85149; font-size: 12px; }
-  .toggle-wrap { margin-bottom: 14px; display: flex; align-items: center; gap: 10px; }
-  .toggle { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 6px 12px;
-    cursor: pointer; border-radius: 6px; font: inherit; font-size: 12px; }
-  .toggle:disabled { opacity: 0.5; cursor: wait; }
-  .hint { color: #6e7681; font-size: 11px; }
+  /* top bar */
+  .topbar { display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .flame-dot { width: 14px; height: 14px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #ffd0a8, var(--flame) 55%, var(--flame-strong));
+    box-shadow: 0 0 0 4px var(--flame-tint); flex: none; }
+  .wordmark { font-size: 22px; font-weight: 800; color: var(--ink); letter-spacing: -0.02em; }
+  .tagline { font-size: 12.5px; color: var(--muted); margin-top: 1px; max-width: 460px; }
+  .controls { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+
+  /* toggle / kill switch */
+  .banner { display: block; margin: 0 0 8px; padding: 9px 13px; background: var(--bad-tint);
+    border: 1px solid #f3b6af; border-radius: 9px; color: #9c2b20; font-size: 12px; max-width: 520px; }
+  .banner strong { color: #8a2117; }
+  .switch { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
+  .switch-state { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600;
+    padding: 3px 10px; border-radius: 999px; }
+  .switch-state.on { color: var(--good); background: var(--good-tint); }
+  .switch-state.off { color: var(--bad); background: var(--bad-tint); }
+  .switch-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .switch-btn { background: var(--surface); color: var(--ink); border: 1px solid var(--border-strong);
+    padding: 6px 13px; cursor: pointer; border-radius: 8px; font: inherit; font-size: 12px; font-weight: 600;
+    box-shadow: var(--shadow); }
+  .switch-btn:hover { border-color: var(--flame); color: var(--flame-ink); }
+  .hint { color: var(--muted); font-size: 11px; }
 
   /* compress-scope chips */
-  .models-wrap { margin: -6px 0 14px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-  .models-label { color: #8b949e; font-size: 12px; }
-  .chip { background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 12px;
-    padding: 3px 11px; cursor: pointer; font: inherit; font-size: 12px; }
-  .chip:hover { border-color: #6e7681; color: #c9d1d9; }
-  .chip.on { background: rgba(31,111,235,0.2); color: #58a6ff; border-color: #1f6feb; }
+  .models { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 18px; }
+  .models-label { color: var(--ink-2); font-size: 12px; font-weight: 600; }
+  .chip { background: var(--surface); color: var(--ink-2); border: 1px solid var(--border-strong);
+    border-radius: 999px; padding: 4px 12px; cursor: pointer; font: inherit; font-size: 12px; }
+  .chip:hover { border-color: var(--flame); color: var(--flame-ink); }
+  .chip.on { background: var(--flame-tint); color: var(--flame-ink); border-color: var(--flame);
+    font-weight: 600; }
 
-  /* context map */
-  .ctxmap { margin: 6px 0 16px; padding: 10px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; }
-  .ctxmap-head { font-size: 13px; color: #c9d1d9; margin-bottom: 4px; }
-  .rec-view { color: #58a6ff; text-decoration: underline; cursor: pointer; }
-  .rec-view:hover { color: #79c0ff; }
-  .ctxmap-imgs-title { font-size: 11px; color: #6e7681; margin: 8px 0 4px; }
-  .ctxmap-imgs { display: flex; flex-wrap: wrap; gap: 4px; max-height: 460px; overflow: auto;
-    background: #fff; padding: 4px; border: 1px solid #30363d; border-radius: 4px; }
-  .ctxmap-img { height: 150px; width: auto; max-width: 260px; object-fit: contain; object-position: top left;
-    image-rendering: pixelated; background: #fff; border: 1px solid #d0d7de; }
-  .ctxmap-img.img-gone { width: 150px; height: 60px; background: #161b22; border: 1px dashed #30363d;
-    color: #6e7681; font-size: 10px; }
-  .ctxmap-pct { color: #3fb950; font-weight: 600; }
-  .ctxmap-sub { font-size: 11px; color: #8b949e; margin: 6px 0 4px; }
-  .ctxmap-row { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; padding: 3px 0; border-bottom: 1px solid #161b22; }
-  .ctxmap-lbl { color: #8b949e; }
-  .ctxmap-val { color: #c9d1d9; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .ctxmap-foot { margin-top: 6px; }
+  /* hero */
+  #frag-session { display: block; margin-bottom: 16px; }
+  .hero { background: linear-gradient(135deg, #fff8f4, var(--surface) 60%); border: 1px solid var(--border);
+    border-left: 4px solid var(--flame); border-radius: var(--radius); padding: 20px 24px; box-shadow: var(--shadow); }
+  .hero-neg { border-left-color: var(--bad); }
+  .hero-eyebrow { font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 8px; }
+  .hero-headline { font-size: 28px; font-weight: 700; color: var(--ink); letter-spacing: -0.02em; line-height: 1.1; }
+  .hero-num { font-size: 56px; font-weight: 800; line-height: 1; margin-right: 8px;
+    background: linear-gradient(135deg, #ff9a4d, var(--flame) 55%, var(--flame-strong));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    font-variant-numeric: tabular-nums; }
+  .hero-neg .hero-num { background: linear-gradient(135deg, #f0857a, var(--bad));
+    -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero-sub { font-size: 14.5px; color: var(--ink-2); margin-top: 12px; max-width: 720px; }
+  .hero-meta { font-size: 12px; color: var(--muted); margin-top: 10px; padding-top: 10px;
+    border-top: 1px dashed var(--border-strong); }
+  .hero-empty .hero-headline { color: var(--muted); font-size: 24px; }
 
-  /* session summary */
-  #frag-session .line { font-size: 14px; color: #c9d1d9; margin-bottom: 12px; padding: 8px 12px;
-    background: #161b22; border: 1px solid #30363d; border-radius: 6px; }
-  #frag-session .label { font-weight: 600; color: #8b949e; letter-spacing: 0.04em; }
-  #frag-session .num { font-variant-numeric: tabular-nums; color: #3fb950; font-weight: 600; }
+  /* supporting stat strip */
+  .strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 14px; }
+  @media (max-width: 1000px) { .strip { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 560px) { .strip { grid-template-columns: 1fr; } }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 14px 16px; box-shadow: var(--shadow); }
+  .tile-label { font-size: 11.5px; font-weight: 600; color: var(--ink-2); margin-bottom: 8px;
+    display: flex; align-items: center; gap: 5px; }
+  .tile-value { font-size: 26px; font-weight: 800; color: var(--ink); font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em; line-height: 1.1; }
+  .tile-value.pos { color: var(--good); } .tile-value.neg { color: var(--bad); }
+  .tile-value.muted-val { color: var(--muted); font-size: 18px; font-weight: 600; }
+  .tile-sub { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
+  .q { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px;
+    border-radius: 50%; background: var(--surface-2); border: 1px solid var(--border-strong);
+    color: var(--muted); font-size: 9px; font-weight: 700; cursor: help; }
 
-  /* stats header cards */
-  .grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 14px; margin-bottom: 22px; }
-  @media (max-width: 1400px) { .grid { grid-template-columns: repeat(3, 1fr); } }
-  @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, 1fr); } }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px 16px; }
-  .card .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
-    color: #8b949e; margin-bottom: 10px; }
-  .value { font-size: 24px; font-weight: 600; color: #e6edf3; font-variant-numeric: tabular-nums; }
-  .value.pos { color: #3fb950; } .value.neg { color: #f85149; }
-  .value.small-sample { color: #8b949e; font-size: 18px; font-weight: 500; }
-  details.math { margin-top: 10px; font-size: 11px; }
-  details.diagnostic { margin: 0 0 22px; font-size: 12px; color: #8b949e; }
-  details summary { cursor: pointer; user-select: none; color: #58a6ff; }
-  details summary::-webkit-details-marker { display: none; }
-  details summary::before { content: '\\25B8 '; color: #6e7681; font-size: 9px; }
-  details[open] summary::before { content: '\\25BE '; }
-  details summary:hover { color: #79c0ff; }
-  details.diagnostic summary { padding: 6px 0; }
-  .formula { background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 8px 10px;
-    margin-top: 6px; font: 11px/1.5 'SF Mono', Menlo, monospace; color: #c9d1d9;
-    white-space: pre-wrap; word-break: break-word; }
-  .formula .k { color: #8b949e; } .formula .v { color: #e6edf3; } .formula .op { color: #f0883e; }
-  .formula .src { color: #6e7681; font-size: 10px; display: block; margin-top: 6px;
-    border-top: 1px solid #21262d; padding-top: 6px; }
-  .diag-headline { color: #c9d1d9; margin-bottom: 8px; }
-  .diag-headline .pos { color: #3fb950; font-weight: 600; }
-  .diag-headline .neg { color: #f85149; font-weight: 600; }
+  /* math drawer */
+  .drawer { margin: 0 0 14px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+  .drawer > summary { cursor: pointer; user-select: none; list-style: none; padding: 12px 16px;
+    font-size: 13px; font-weight: 600; color: var(--flame-ink); display: flex; align-items: center; gap: 8px; }
+  .drawer > summary::-webkit-details-marker { display: none; }
+  .drawer > summary::before { content: '▸'; color: var(--flame); font-size: 11px; }
+  .drawer[open] > summary::before { content: '▾'; }
+  .drawer > summary:hover { background: var(--surface-2); }
+  .drawer-intro { padding: 0 16px 10px; font-size: 12px; color: var(--ink-2); }
+  .drawer-intro em { color: var(--flame-ink); font-style: normal; font-weight: 600; }
+  .math-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; padding: 0 16px 16px; }
+  @media (max-width: 860px) { .math-grid { grid-template-columns: 1fr; } }
+  .math-block h4 { margin: 0 0 6px; font-size: 12px; color: var(--ink); }
+  .formula { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 9px 11px; font: 11px/1.55 var(--mono); color: var(--ink-2); white-space: pre-wrap;
+    word-break: break-word; }
+  .formula .k { color: var(--muted); } .formula .v { color: var(--ink); } .formula .op { color: var(--flame); }
+  .formula .sp { height: 6px; }
+  .formula .src { color: var(--muted); font-size: 10px; display: block; margin-top: 7px;
+    border-top: 1px solid var(--border); padding-top: 6px; }
+  .updated { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); animation: pulse 2s infinite; }
+  @keyframes pulse { 50% { opacity: 0.35; } }
 
-  /* tables (recent + stats) */
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th { text-align: left; color: #6e7681; font-weight: 500; padding: 6px 8px;
-    border-bottom: 1px solid #30363d; }
-  td { padding: 6px 8px; border-bottom: 1px solid #21262d; font-variant-numeric: tabular-nums;
-    vertical-align: top; }
-  tr:last-child td { border-bottom: none; }
+  /* sections + cards */
+  .section { margin-top: 26px; }
+  .section-head { font-size: 14px; font-weight: 700; color: var(--ink); margin: 0 0 12px;
+    display: flex; align-items: baseline; gap: 10px; }
+  .section-sub { font-size: 12px; font-weight: 400; color: var(--muted); }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 16px 18px; box-shadow: var(--shadow); min-width: 0; }
+  .card-head { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); margin: 0 0 12px; }
+  .card-head.spaced { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border); }
+
+  /* x-ray two-column */
+  .xray { display: grid; grid-template-columns: 1.15fr 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 1000px) { .xray { grid-template-columns: 1fr; } }
+
+  /* context map (image vs text) */
+  .ctxmap { font-size: 13px; }
+  .empty-note { color: var(--muted); font-size: 12.5px; padding: 14px; background: var(--surface-2);
+    border: 1px dashed var(--border-strong); border-radius: 10px; }
+  .ctx-headline { font-size: 13px; color: var(--ink-2); margin-bottom: 10px; }
+  .ctx-title { display: inline-block; font-weight: 700; color: var(--ink); margin-right: 6px; }
+  .ctx-big { font-size: 22px; font-weight: 800; color: var(--flame); font-variant-numeric: tabular-nums; }
+  .legend { display: flex; gap: 8px; margin-bottom: 10px; }
+  .tag { font-size: 11px; font-weight: 600; padding: 3px 9px 3px 22px; border-radius: 999px; position: relative; }
+  .tag::before { content: ''; position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
+    width: 8px; height: 8px; border-radius: 2px; }
+  .tag-img { background: var(--img-tint); color: var(--img-ink); }
+  .tag-img::before { background: var(--img); }
+  .tag-txt { background: var(--txt-tint); color: var(--txt-ink); }
+  .tag-txt::before { background: var(--txt); }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 560px) { .split { grid-template-columns: 1fr; } }
+  .split-col { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--surface); }
+  .split-img { border-top: 3px solid var(--img); background: linear-gradient(180deg, var(--img-tint), var(--surface) 40%); }
+  .split-txt { border-top: 3px solid var(--txt); background: linear-gradient(180deg, var(--txt-tint), var(--surface) 40%); }
+  .split-head { font-size: 12px; font-weight: 700; color: var(--ink); margin-bottom: 8px; display: flex;
+    flex-direction: column; gap: 2px; }
+  .split-sum { font-size: 10.5px; font-weight: 600; color: var(--muted); }
+  .ctx-row { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; padding: 4px 0;
+    border-bottom: 1px solid var(--border); }
+  .ctx-row:last-of-type { border-bottom: none; }
+  .ctx-lbl { color: var(--ink-2); } .ctx-val { color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .muted-row { color: var(--muted); font-style: italic; }
+  .split-note { font-size: 10.5px; color: var(--muted); margin-top: 7px; }
+  .pages-title { font-size: 11px; color: var(--ink-2); margin: 12px 0 6px; }
+  .pages { display: flex; flex-wrap: wrap; gap: 6px; max-height: 320px; overflow: auto;
+    background: var(--surface-2); padding: 6px; border: 1px solid var(--border); border-radius: 8px; }
+  .page { height: 130px; width: auto; max-width: 230px; object-fit: contain; object-position: top left;
+    image-rendering: pixelated; background: #fff; border: 1px solid var(--border-strong); border-radius: 4px;
+    cursor: pointer; transition: border-color .12s, transform .12s; }
+  .page:hover { border-color: var(--flame); transform: translateY(-1px); }
+  .page.page-gone { width: 150px; height: 56px; background: var(--surface-2); border: 1px dashed var(--border-strong);
+    color: var(--muted); font-size: 10px; cursor: default; }
+
+  /* recent table */
+  .row-view { color: var(--flame-ink); font-weight: 600; text-decoration: none; cursor: pointer; white-space: nowrap; }
+  .row-view:hover { text-decoration: underline; }
+  table.rtable, table.dtable { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .rtable th, .dtable th { text-align: left; color: var(--muted); font-weight: 600; padding: 7px 8px;
+    border-bottom: 1px solid var(--border-strong); white-space: nowrap; }
+  .rtable td, .dtable td { padding: 7px 8px; border-bottom: 1px solid var(--border);
+    font-variant-numeric: tabular-nums; vertical-align: middle; color: var(--ink-2); }
+  .rtable tr:last-child td, .dtable tr:last-child td { border-bottom: none; }
+  .rtable tbody tr:hover, .rtable tbody tr:hover { background: var(--surface-2); }
+  /* Keep wide tables inside their card: scroll horizontally rather than
+     pushing the card border out. Fires only when the nowrap columns exceed
+     the card width (narrow x-ray column / small window); no scrollbar when
+     they fit. The table keeps width:100% so it fills at wide widths. */
+  #frag-recent, #frag-stats { overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
+  #frag-recent table, #frag-stats table { min-width: max-content; }
+  #frag-latest { overflow: auto; scrollbar-width: thin; }
   th.num, td.num { text-align: right; }
-  td.good { color: #3fb950; } td.warn { color: #d29922; } td.bad { color: #f85149; }
-  td.pos { color: #3fb950; }
-  .thumb-strip { display: flex; gap: 3px; align-items: center; justify-content: flex-end; }
-  .thumb-btn { padding: 0; border: 1px solid #30363d; border-radius: 3px; background: #fff;
-    cursor: pointer; line-height: 0; }
-  .thumb-btn:hover, .thumb-btn:focus-visible { border-color: #58a6ff; outline: none; }
-  .thumb { height: 28px; width: auto; max-width: 28px; object-fit: cover;
-    object-position: top left; display: block; image-rendering: pixelated; }
-  .img-cell { text-align: right; }
+  td.pos { color: var(--good); font-weight: 600; }
+  .endp { color: var(--ink); font-family: var(--mono); font-size: 11px; }
+  .empty-cell { color: var(--muted); text-align: center; padding: 18px; }
+  .pill { display: inline-block; min-width: 38px; text-align: center; font-size: 11px; font-weight: 700;
+    padding: 2px 8px; border-radius: 999px; font-variant-numeric: tabular-nums; }
+  .pill-good { background: var(--good-tint); color: var(--good); }
+  .pill-warn { background: #fbf0db; color: var(--warn); }
+  .pill-bad { background: var(--bad-tint); color: var(--bad); }
+  .badge { font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 999px; }
+  .badge-img { background: var(--img-tint); color: var(--img-ink); }
+  .badge-txt { background: var(--txt-tint); color: var(--txt-ink); }
 
-  /* latest image viewer */
-  .preview-crop { width: 100%; height: 400px; overflow: hidden; background: #fff;
-    border: 1px solid #30363d; border-radius: 4px; padding: 4px; box-sizing: border-box; }
-  .preview-crop img { display: block; width: auto; height: auto; max-width: none;
-    image-rendering: pixelated; }
-  .pin-bar { margin-bottom: 8px; }
-  .back-btn, .src-btn { font-size: 11px; background: #21262d; color: #58a6ff;
-    border: 1px solid #30363d; border-radius: 4px; padding: 2px 8px; cursor: pointer; }
-  .src-btn { padding: 1px 6px; margin-left: 8px; }
-  .back-btn:hover, .src-btn:hover { background: #30363d; }
-  .src-pane { margin-top: 8px; max-height: 400px; overflow: auto; background: #161b22;
-    border: 1px solid #30363d; border-radius: 4px; padding: 8px; font-size: 11px;
-    line-height: 1.4; white-space: pre-wrap; word-break: break-word; color: #c9d1d9; }
-  .evicted { font-size: 11px; color: #6e7681; padding: 12px 0; }
+  /* inspector */
+  .viewer-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .mini-btn { font-size: 11px; background: var(--surface); color: var(--flame-ink); border: 1px solid var(--border-strong);
+    border-radius: 7px; padding: 3px 9px; cursor: pointer; font-weight: 600; }
+  .mini-btn:hover { border-color: var(--flame); }
+  .mini-label { font-size: 11px; color: var(--muted); }
+  .frame { background: #fff; border: 1px solid var(--border-strong); border-radius: 8px; padding: 5px;
+    overflow: auto; max-height: 360px; scrollbar-width: thin; }
+  .frame img { display: block; width: auto; height: auto; max-width: none; image-rendering: pixelated; }
+  .frame-sm { max-height: 260px; }
+  .viewer-caption { font-size: 11px; color: var(--muted); margin-top: 8px; display: flex; align-items: center;
+    gap: 10px; flex-wrap: wrap; }
+  .pairing { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 10px; }
+  .pair-head { font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 6px; display: inline-block;
+    margin-bottom: 6px; }
+  .pair-img { background: var(--img-tint); color: var(--img-ink); }
+  .pair-txt { background: var(--txt-tint); color: var(--txt-ink); }
+  .pair-mid { font-size: 11px; font-weight: 600; color: var(--muted); text-align: center; }
+  .src-pane { margin: 0; max-height: 280px; overflow: auto; background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 8px; padding: 9px; font: 11px/1.45 var(--mono);
+    white-space: pre-wrap; word-break: break-word; color: var(--ink-2); }
+  .evicted { font-size: 11.5px; color: var(--muted); padding: 12px; background: var(--surface-2);
+    border: 1px dashed var(--border-strong); border-radius: 8px; }
 
-  /* sessions chart */
-  .status { margin-bottom: 12px; color: #6e7681; font-size: 12px; }
-  .chart { display: flex; flex-direction: column; gap: 8px; }
-  .bar-row { display: flex; align-items: center; gap: 10px; font-size: 12px; }
-  .blabel { width: 132px; flex: none; overflow: hidden; text-overflow: ellipsis;
-    white-space: nowrap; color: #c9d1d9; }
-  .track { flex: 1; min-width: 0; height: 14px; background: #21262d; border-radius: 3px;
-    overflow: hidden; }
-  .fill { height: 100%; background: #3fb950; border-radius: 3px; }
-  .bvalue { width: 72px; flex: none; text-align: right; font-variant-numeric: tabular-nums;
-    color: #3fb950; }
-  .bvalue.neg { color: #f85149; }
-  .axis { margin-top: 12px; color: #6e7681; font-size: 11px; }
-  .empty { text-align: center; color: #6e7681; padding: 24px; font-size: 12px; }
+  /* sessions bars */
+  .status { margin-bottom: 12px; color: var(--muted); font-size: 12px; }
+  .bars { display: flex; flex-direction: column; gap: 8px; }
+  .bar-row { display: flex; align-items: center; gap: 12px; font-size: 12px; }
+  .bar-label { width: 150px; flex: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--ink); font-family: var(--mono); font-size: 11px; }
+  .bar-track { flex: 1; min-width: 0; height: 16px; background: var(--surface-2); border-radius: 5px;
+    overflow: hidden; border: 1px solid var(--border); }
+  .bar-fill { height: 100%; border-radius: 5px 0 0 5px;
+    background: linear-gradient(90deg, #ffa766, var(--flame)); }
+  .bar-val { width: 78px; flex: none; text-align: right; font-variant-numeric: tabular-nums;
+    color: var(--flame-ink); font-weight: 600; }
+  .bar-val.neg { color: var(--bad); }
+  .axis { margin-top: 12px; color: var(--muted); font-size: 11px; }
+  .empty { text-align: center; color: var(--muted); padding: 22px; font-size: 12px; }
 
-  /* toast tray (Alpine) */
-  .tray { position: fixed; bottom: 16px; right: 16px; display: flex; flex-direction: column;
-    gap: 8px; z-index: 1000; pointer-events: none; }
-  .toast { background: #21262d; color: #f85149; border: 1px solid #f85149; border-radius: 6px;
-    padding: 10px 14px; font-size: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-    display: flex; align-items: center; gap: 12px; pointer-events: auto; max-width: 360px; }
-  .toast button { background: transparent; color: inherit; border: 0; cursor: pointer;
-    font-size: 16px; line-height: 1; padding: 0; }
+  /* toast tray */
+  .tray { position: fixed; bottom: 16px; right: 16px; display: flex; flex-direction: column; gap: 8px;
+    z-index: 1000; pointer-events: none; }
+  .toast { background: var(--surface); color: var(--bad); border: 1px solid #f0b3ab; border-radius: 9px;
+    padding: 10px 14px; font-size: 12px; box-shadow: 0 8px 24px rgba(60,35,15,.14); display: flex;
+    align-items: center; gap: 12px; pointer-events: auto; max-width: 360px; }
+  .toast button { background: transparent; color: inherit; border: 0; cursor: pointer; font-size: 16px;
+    line-height: 1; padding: 0; }
 `;
 
 // Glue between htmx swaps and the page's two bits of client state:
 //   - window.pp: image-pin + source-pane state, sent to /fragments/latest as
-//     query params via hx-vals (evaluated at request time). ppPin/ppSource
-//     mutate it and force an immediate refresh instead of waiting for the
-//     next 2s tick.
-//   - <details> open state: htmx innerHTML swaps would close every
-//     "show calculation" panel on each poll; record open ids before the swap
-//     and restore them after.
+//     query params via hx-vals. ppPin/ppSource mutate it and force an
+//     immediate refresh instead of waiting for the next 2s tick.
+//   - <details> open state: innerHTML swaps would close the math drawer on
+//     every poll; record open ids before the swap and restore them after.
 //   - toasts: htmx request errors are pushed into the Alpine tray.
 const GLUE_JS = `
   window.pp = { pin: null, src: false };
@@ -713,45 +923,68 @@ const GLUE_JS = `
 
 export function renderPage(port: number): string {
   // Each fragment div polls its own endpoint. `hx-trigger="load, every Ns"`
-  // paints immediately on page load, then keeps the legacy cadence
-  // (2s live counters, 5s slow aggregates).
+  // paints on page load then keeps the cadence (2s live, 5s slow aggregates).
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>pxpipe - live dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pxpipe — live dashboard</title>
 <style>${CSS}</style>
 </head>
 <body>
-<h1><span class="dot"></span>pxpipe</h1>
 
-<div id="frag-toggle" hx-get="/fragments/toggle" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+<header class="topbar">
+  <div class="brand">
+    <span class="flame-dot"></span>
+    <div>
+      <div class="wordmark">pxpipe</div>
+      <div class="tagline">See exactly what got turned into images to shrink your Claude Code bill.</div>
+    </div>
+  </div>
+  <div class="controls">
+    <div id="frag-toggle" hx-get="/fragments/toggle" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+  </div>
+</header>
+
 <div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
-<div id="frag-session" hx-get="/fragments/session-summary" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
-<div id="frag-header" hx-get="/fragments/header" hx-trigger="load, every 2s" hx-swap="innerHTML"><div class="sub">connecting&hellip;</div></div>
 
-<div class="row">
-  <div class="panel">
-    <h2>recent requests</h2>
-    <div id="frag-context-map" hx-get="/fragments/context-map" hx-trigger="load" hx-swap="innerHTML"></div>
-    <div id="frag-recent" hx-get="/fragments/recent" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+<div id="frag-session" hx-get="/fragments/session-summary" hx-trigger="load, every 2s" hx-swap="innerHTML">
+  <div class="hero hero-empty"><div class="hero-headline">Connecting…</div></div>
+</div>
+
+<div id="frag-header" hx-get="/fragments/header" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+
+<section class="section">
+  <h2 class="section-head">What happened to your context <span class="section-sub">click a request to see image vs text</span></h2>
+  <div class="xray">
+    <div class="card">
+      <h3 class="card-head">Recent requests</h3>
+      <div id="frag-recent" hx-get="/fragments/recent" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+    </div>
+    <div class="card">
+      <h3 class="card-head">Image vs text breakdown</h3>
+      <div id="frag-context-map" hx-get="/fragments/context-map" hx-trigger="load" hx-swap="innerHTML"></div>
+      <h3 class="card-head spaced">Image ↔ source inspector</h3>
+      <div id="frag-latest" hx-get="/fragments/latest" hx-trigger="load, every 2s, pp-refresh" hx-swap="innerHTML"
+           hx-vals='js:{pin: window.pp.pin == null ? "" : window.pp.pin, source: window.pp.src ? "1" : ""}'></div>
+    </div>
   </div>
-  <div class="panel">
-    <h2>latest rendered image</h2>
-    <div id="frag-latest" hx-get="/fragments/latest" hx-trigger="load, every 2s, pp-refresh" hx-swap="innerHTML"
-         hx-vals='js:{pin: window.pp.pin == null ? "" : window.pp.pin, source: window.pp.src ? "1" : ""}'></div>
+</section>
+
+<section class="section">
+  <h2 class="section-head">Top sessions <span class="section-sub">by tokens saved</span></h2>
+  <div class="card">
+    <div id="frag-sessions" hx-get="/fragments/sessions" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
   </div>
-</div>
+</section>
 
-<div class="panel" style="margin-bottom:22px">
-  <h2>sessions <span class="small" style="color:#6e7681">(top savers)</span></h2>
-  <div id="frag-sessions" hx-get="/fragments/sessions" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
-</div>
-
-<div class="panel" style="margin-bottom:22px">
-  <h2>stats <span class="small" style="color:#6e7681">(full history)</span></h2>
-  <div id="frag-stats" hx-get="/fragments/stats" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
-</div>
+<section class="section">
+  <h2 class="section-head">Full history <span class="section-sub">every event on disk</span></h2>
+  <div class="card">
+    <div id="frag-stats" hx-get="/fragments/stats" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
+  </div>
+</section>
 
 <div class="tray" x-data="{ toasts: [], next: 1 }"
      @pp-toast.window="const id = next++; toasts.push({ id, text: $event.detail.text }); setTimeout(() => toasts = toasts.filter(t => t.id !== id), 5000)">
