@@ -4,6 +4,44 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## 0.6.0 — 2026-06-21
+
+Structure-through role attribution and a turn-index recency anchor for collapsed
+history images, plus per-model GPT rendering profiles. The model now reads who
+said each turn and how recent it is, instead of reconstructing it from a
+flattened, role-ambiguous blob (which led it to resurface the opening turn as if
+it were the live request).
+
+### Added
+- **Turn-index recency anchor.** Each collapsed turn serializes as `<user t="N">` /
+  `<assistant t="N">` with an absolute turn index (larger N = more recent), so the
+  model can distinguish turn 1 from turn 60 and stops treating the opening turn as
+  the live request. Absolute (never relative) so frozen chunks stay byte-identical
+  and keep hitting the prompt cache. Applied on both the Anthropic (`history.ts`)
+  and GPT (`openai-history.ts`) paths.
+- **colorByRole role tinting.** `<user>`/`<assistant>` tags in the history image are
+  colored via a parallel "slot string" carried from serialize time, replacing the
+  parse-back that miscolored a body quoting a literal tag. (`render.ts`)
+- **Per-model GPT profiles (`gpt-model-profiles.ts`).** Vision-cost regime, strip
+  width, and max image height per model id, retunable via `PXPIPE_GPT_PROFILES` (a
+  JSON model-id-prefix map) without a code change. Built-ins are behavior-identical
+  to the prior hardcoded values.
+
+### Changed
+- **↵-packing for sentinel-bearing content.** A pre-existing ↵ (U+21B5) in content
+  is swapped to ⏎ (U+23CE) in render-prep so `reflow` packs newlines instead of
+  bailing to a raw, unpacked render — common when the content is about pxpipe
+  itself (rendered dumps, OCR). Render-only; originals are preserved.
+
+### Fixed
+- **Banner single source of truth.** The GPT intro/outro now alias the Anthropic
+  constants in `history.ts` instead of being byte-copies, so the two paths cannot
+  silently drift on turn-attribution wording.
+- **Slot/text alignment.** `slotCopyBody` neutralizes literal slot-marker control
+  chars to a width-equivalent control char (U+0003) instead of a space, which
+  `minifyForRender` would strip as trailing whitespace and desync the slot from the
+  text (smearing role colors).
+
 ## 0.5.0 — 2026-06-20
 
 Cache-stable history-collapse imaging for both providers, with GPT-5.6 promoted
