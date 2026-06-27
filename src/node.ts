@@ -11,7 +11,15 @@ import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
+import {
+  parseExportArgv,
+  runExportCore,
+  shouldIncludeFile,
+  type ExportParsed,
+  type ExportResult,
+} from './core/export.js';
 import {
   toTrackEvent,
   TRACK_BODY_INLINE_MAX,
@@ -117,6 +125,7 @@ function printHelp(): void {
 
 Usage:
   pxpipe                run the proxy (no flags)
+  pxpipe export [...]   render files/diff to PNG pages + cost report (see pxpipe export --help)
 
 The proxy compresses eligible tools, schemas, reminders, tool_results,
 and history; tracks events to disk; and measures real saved_pct via
@@ -548,12 +557,318 @@ async function maybeWriteBodySidecar(
   }
 }
 
+// ---- pxpipe export -------------------------------------------------------
+
+function printExportHelp(): void {
+  console.log(`pxpipe export — render code/text to PNG pages for compressed LLM context
+
+Usage:
+  pxpipe export [target ...]    default target is "." (current directory)
+
+Targets:
+  Files or directories to include. Multiple targets are joined with a header
+  separator line. Defaults to "." when none are given.
+
+Options:
+  --include <glob>   include only files matching glob (repeatable)
+  --exclude <glob>   exclude files matching glob (repeatable)
+  --git              render "git diff HEAD" plus untracked files
+  --diff <ref>       render "git diff <ref>"
+  --stdin            read source text from stdin instead of files
+  --out <dir>        base output directory (default \$TMPDIR or /tmp)
+  --model <id>       model id for vision-token estimate (default claude-sonnet-4-5)
+  --json             print report as JSON
+  --open             reveal the output folder when done (macOS) so you can
+                     drag the PNG pages straight into your chat
+  -h, --help         show this help
+
+Output:
+  <out>/pxpipe-export-<hash>/
+    page-001.png ...  rendered image pages
+    factsheet.txt     verbatim precision tokens (paths, SHAs, ids, numbers)
+    manifest.json     metadata + token report
+    prompt.txt        paste-ready agent instruction referencing the images
+
+Report columns:
+  text tokens   approximate tokens if the source were sent as plain text
+  image tokens  estimated tokens to send the rendered PNG pages
+  % saved       (text − image) / text × 100
+
+Examples:
+  pxpipe export .                              # whole directory
+  pxpipe export --include "*.ts" src/          # TypeScript files only
+  pxpipe export --git                          # uncommitted changes
+  pxpipe export --diff HEAD~3                  # last 3 commits
+  pxpipe export --open src/                    # render src/, then reveal the folder
+  cat big-file.txt | pxpipe export --stdin
+`);
+}
+
+/** Directories never descended into when walking files. */
+const WALK_SKIP_DIRS = new Set([
+  'node_modules', '.git', '.svn', '.hg', 'dist', 'build',
+  '__pycache__', '.cache', '.next', '.nuxt', '.turbo',
+]);
+
+const MAX_FILE_BYTES = 1_000_000; // 1 MiB
+
+/** Returns true if `buf` looks like binary (contains a null byte in the first 512 bytes). */
+function looksLikeBinary(buf: Buffer): boolean {
+  const check = Math.min(buf.byteLength, 512);
+  for (let i = 0; i < check; i++) {
+    if (buf[i] === 0) return true;
+  }
+  return false;
+}
+
+interface CollectedFile {
+  relPath: string;
+  content: string;
+}
+
+/** Recursively walk a directory, collecting text files that pass include/exclude filters. */
+function walkDir(
+  dir: string,
+  rootDir: string,
+  include: string[],
+  exclude: string[],
+  out: CollectedFile[],
+): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    const rel = path.relative(rootDir, full).replace(/\\/g, '/');
+    if (entry.isDirectory()) {
+      if (WALK_SKIP_DIRS.has(entry.name)) continue;
+      walkDir(full, rootDir, include, exclude, out);
+    } else if (entry.isFile()) {
+      if (!shouldIncludeFile(rel, include, exclude)) continue;
+      let stat: fs.Stats;
+      try { stat = fs.statSync(full); } catch { continue; }
+      if (stat.size > MAX_FILE_BYTES) continue;
+      let buf: Buffer;
+      try { buf = fs.readFileSync(full); } catch { continue; }
+      if (looksLikeBinary(buf)) continue;
+      out.push({ relPath: rel, content: buf.toString('utf8') });
+    }
+  }
+}
+
+/** Collect files from a list of targets (files or directories). */
+function collectFilesFromTargets(
+  targets: string[],
+  include: string[],
+  exclude: string[],
+): CollectedFile[] {
+  const files: CollectedFile[] = [];
+  for (const target of targets) {
+    let st: fs.Stats;
+    try { st = fs.statSync(target); } catch {
+      console.warn(`[pxpipe export] skipping inaccessible target: ${target}`);
+      continue;
+    }
+    if (st.isDirectory()) {
+      walkDir(target, target, include, exclude, files);
+    } else if (st.isFile()) {
+      const rel = path.basename(target);
+      if (!shouldIncludeFile(rel, include, exclude)) continue;
+      if (st.size > MAX_FILE_BYTES) {
+        console.warn(`[pxpipe export] skipping oversized file: ${target}`);
+        continue;
+      }
+      let buf: Buffer;
+      try { buf = fs.readFileSync(target); } catch { continue; }
+      if (looksLikeBinary(buf)) {
+        console.warn(`[pxpipe export] skipping binary file: ${target}`);
+        continue;
+      }
+      files.push({ relPath: rel, content: buf.toString('utf8') });
+    }
+  }
+  return files;
+}
+
+/** Run a git command in `cwd`, return stdout string or null on failure. */
+function gitRun(args: string[], cwd: string): string | null {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  if (result.status !== 0 || result.error) return null;
+  return result.stdout ?? null;
+}
+
+/** Collect source text for the export run. Returns [sourceText, sourceFiles[]] */
+async function collectSource(opts: ExportParsed): Promise<[string, string[]]> {
+  // --stdin
+  if (opts.stdin) {
+    const chunks: string[] = [];
+    process.stdin.setEncoding('utf8');
+    for await (const chunk of process.stdin) {
+      if (typeof chunk === 'string') chunks.push(chunk);
+    }
+    return [chunks.join(''), []];
+  }
+
+  // --diff <ref>
+  if (opts.diff !== undefined) {
+    const cwd = opts.targets.length > 0 ? opts.targets[0]! : process.cwd();
+    const diff = gitRun(['diff', opts.diff], cwd);
+    if (diff === null) {
+      console.error(`[pxpipe export] git diff ${opts.diff} failed`);
+      process.exit(1);
+    }
+    return [diff, []];
+  }
+
+  // --git
+  if (opts.git) {
+    const cwd = opts.targets.length > 0 ? opts.targets[0]! : process.cwd();
+    const diff = gitRun(['diff', 'HEAD'], cwd) ?? '';
+    // Collect untracked files
+    const untrackedOut = gitRun(['ls-files', '--others', '--exclude-standard'], cwd) ?? '';
+    const untrackedFiles = untrackedOut
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    let untracked = '';
+    for (const rel of untrackedFiles) {
+      const full = path.join(cwd, rel);
+      let buf: Buffer;
+      try { buf = fs.readFileSync(full); } catch { continue; }
+      if (!looksLikeBinary(buf)) {
+        untracked += `\n===== ${rel} =====\n` + buf.toString('utf8');
+      }
+    }
+    const sourceText = diff + untracked;
+    return [sourceText, []];
+  }
+
+  // File/directory mode (default)
+  const targets = opts.targets.length > 0 ? opts.targets : ['.'];
+  const files = collectFilesFromTargets(targets, opts.include, opts.exclude);
+  if (files.length === 0) {
+    console.warn('[pxpipe export] no files collected');
+  }
+  const sourceText = files
+    .map((f) => `===== ${f.relPath} =====\n${f.content}`)
+    .join('\n\n');
+  const sourceFiles = files.map((f) => f.relPath);
+  return [sourceText, sourceFiles];
+}
+
+function formatNumber(n: number): string {
+  return n.toLocaleString('en-US');
+}
+
+function printExportReport(opts: ExportParsed, outDir: string, sourceFiles: string[], result: ExportResult): void {
+  const { manifest } = result;
+  const { tokenReport, pages } = manifest;
+  const totalPngBytes = pages.reduce((s, p) => s + p.bytes, 0);
+
+  if (opts.json) {
+    process.stdout.write(
+      JSON.stringify({
+        outDir,
+        fileCount: sourceFiles.length,
+        sourceChars: manifest.sourceChars,
+        pageCount: pages.length,
+        totalPngBytes,
+        textTokens: tokenReport.textTokens,
+        imageTokens: tokenReport.imageTokens,
+        percentSaved: tokenReport.percentSaved,
+        factsheetItemCount: tokenReport.factsheetItemCount,
+        factsheetDropped: tokenReport.factsheetDropped,
+        model: manifest.model,
+        cols: manifest.cols,
+        generatedAt: manifest.generatedAt,
+      }) + '\n',
+    );
+    return;
+  }
+
+  const saved = tokenReport.percentSaved;
+  const savedStr = saved >= 0 ? `${saved.toFixed(1)}% saved` : `${Math.abs(saved).toFixed(1)}% more expensive`;
+  const droppedNote = tokenReport.factsheetDropped > 0
+    ? ` (${tokenReport.factsheetDropped} dropped)`
+    : '';
+  console.log(
+    `\npxpipe export\n` +
+    `  out:            ${outDir}\n` +
+    `  files:          ${formatNumber(sourceFiles.length)}\n` +
+    `  source chars:   ${formatNumber(manifest.sourceChars)}\n` +
+    `  pages:          ${pages.length} (${formatNumber(totalPngBytes)} bytes)\n` +
+    `  text tokens:    ~${formatNumber(tokenReport.textTokens)}\n` +
+    `  image tokens:   ~${formatNumber(tokenReport.imageTokens)}  (${savedStr})\n` +
+    `  factsheet:      ${tokenReport.factsheetItemCount} items${droppedNote}\n`,
+  );
+  console.log(
+    `next — get this into your chat:\n` +
+    `  1. attach the ${pages.length} page-*.png file${pages.length === 1 ? '' : 's'} from that folder\n` +
+    `  2. paste prompt.txt alongside them (it tells the model what the images are)\n` +
+    `     factsheet.txt has the verbatim paths / ids / numbers if you need exact strings\n` +
+    (opts.open ? `  opening the folder…\n` : `  tip: add --open to reveal the folder automatically\n`),
+  );
+}
+
+async function runExport(argv: string[]): Promise<void> {
+  const parseResult = parseExportArgv(argv);
+
+  if (parseResult.kind === 'help') {
+    printExportHelp();
+    process.exit(0);
+  }
+  if (parseResult.kind === 'error') {
+    console.error(`[pxpipe export] ${parseResult.message}`);
+    console.error(`[pxpipe export] run \`pxpipe export --help\` for usage`);
+    process.exit(2);
+  }
+
+  const opts = parseResult.parsed;
+
+  // Collect source text
+  const [sourceText, sourceFiles] = await collectSource(opts);
+
+  // Unique output dir: <out>/pxpipe-export-XXXXXX/. mkdtemp guarantees a fresh, random
+  // directory so concurrent runs never collide and stale page-NNN.png never bleed in.
+  fs.mkdirSync(opts.out, { recursive: true });
+  const outDir = fs.mkdtempSync(path.join(opts.out, 'pxpipe-export-'));
+
+  // Run core export
+  const result = await runExportCore(sourceText, {
+    sourceFiles,
+    cols: opts.cols,
+    model: opts.model,
+  });
+
+  // Write artifacts
+  for (const artifact of result.artifacts) {
+    fs.writeFileSync(path.join(outDir, artifact.filename), artifact.data);
+  }
+
+  // Print report
+  printExportReport(opts, outDir, sourceFiles, result);
+
+  // --open: reveal the output folder (macOS `open`) so the PNG pages can be
+  // dragged straight into a chat. Best-effort; a failed open is non-fatal
+  // since the report already printed the path.
+  if (opts.open) {
+    spawnSync('open', [outDir], { stdio: 'ignore' });
+  }
+}
+
 // ---- main ----------------------------------------------------------------
 
 async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+  if (argv[0] === 'export') {
+    await runExport(argv.slice(1));
+    return; // server never starts
+  }
   // No subcommands — pxpipe is just the proxy. Stats / sessions / cleanup
   // tools live in the dashboard (see http://127.0.0.1:${port}/).
-  const argv = process.argv.slice(2);
   const opts = parseCli(argv);
   // A/B harness passthrough switch (see the `transform` callback below).
   const forcePassthrough = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
@@ -605,6 +920,7 @@ async function main(): Promise<void> {
       // still logging real usage + count_tokens baselines to its own PXPIPE_LOG.
       // (The dashboard kill switch does the same thing at runtime.)
       if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
+      // Active path: use DEFAULTS in transform.ts for break-even gating.
       return {};
     },
     onRequest: async (e) => {

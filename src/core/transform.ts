@@ -176,9 +176,13 @@ export const HISTORY_CHARS_PER_TOKEN = 2.0;
 /** Anthropic image-billing formula: `tokens ≈ width × height / 750`.
  *  https://docs.anthropic.com/en/docs/build-with-claude/vision#image-tokens
  *  Accurate to ~5% on dense glyph PNGs (N=14 empirical calibration). The renderer
- *  sizes height to content, so per-block images cost far less than full-canvas. */
-const ANTHROPIC_PIXELS_PER_TOKEN = 750;
-const IMAGE_COST_SAFETY_MARGIN = 1.10; // 10% conservative bias toward pass-through
+ *  sizes height to content, so per-block images cost far less than full-canvas.
+ *  Exported so the export pipeline can reuse the same constant rather than hardcoding. */
+export const ANTHROPIC_PIXELS_PER_TOKEN = 750;
+/** Conservative 10% upward bias on Anthropic image token estimates — keeps the gate
+ *  on the safe (pass-through) side when the true cost is near the break-even point.
+ *  Exported so the export pipeline reuses the same value. */
+export const IMAGE_COST_SAFETY_MARGIN = 1.10;
 
 /** Width in px of a single-col PNG. Must stay in sync with `renderChunkToPng` (render.ts). */
 function singleColWidthPx(cols: number): number {
@@ -1199,7 +1203,14 @@ export function truncateForBudget(
   };
 }
 
-async function textToImageBlocks(
+/**
+ * Render text → Anthropic image blocks for the proxy. The column-selection rule below
+ * (shrink, then single-col unless the content fills the width) is mirrored exactly by
+ * the public SDK primitive `renderTextToImages` (library.ts), so the proxy and the
+ * `pxpipe export` CLI emit byte-identical PNGs for the same text. Exported so
+ * export-proxy-align.test.ts can pin that invariant against the real proxy code.
+ */
+export async function textToImageBlocks(
   text: string,
   cols: number,
   numCols: number = 1,
@@ -1224,7 +1235,10 @@ async function textToImageBlocks(
   const imgs =
     effectiveNumCols > 1
       ? await renderTextToPngsMultiCol(text, effectiveCols, effectiveNumCols)
-      : await renderTextToPngsWithCharLimit(text, DENSE_CONTENT_COLS, DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
+      // Single-col dense: shrink the 384-col base to content so the renderer matches the
+      // gate (denseGateGeometry uses DENSE_CONTENT_COLS, priced via shrinkColsToContent).
+      // Was hard-coded to DENSE_CONTENT_COLS, which threw away the shrink the gate assumed.
+      : await renderTextToPngsWithCharLimit(text, shrinkColsToContent(text, DENSE_CONTENT_COLS), DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
   let droppedChars = 0;
   let pixels = 0;
   const droppedCodepoints = new Map<number, number>();

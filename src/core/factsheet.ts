@@ -31,7 +31,8 @@ const PATTERNS: readonly RegExp[] = [
 
 const MIN_LEN = 3;
 const MAX_LEN = 120;
-const MAX_TOKENS = 64; // budget cap per block — highest-priority tokens kept first
+/** Budget cap: highest-priority tokens kept first. Exported so consumers can report drops. */
+export const MAX_TOKENS = 64;
 // At most this many URL exemplars: URLs are long, structured, low OCR-risk, and usually
 // reconstructable, so they must never crowd out short zero-redundancy tokens.
 const MAX_URLS = 8;
@@ -117,11 +118,65 @@ export function extractFactSheetTokens(text: string): string[] {
   return kept;
 }
 
+/**
+ * Page-aware variant of `extractFactSheetTokens` for large source texts.
+ *
+ * Splits `text` into chunks of `charsPerPage` (use `DENSE_CONTENT_CHARS_PER_IMAGE`
+ * from render.ts for the export pipeline), calls `extractFactSheetTokens` on each
+ * chunk (each chunk is smaller than MAX_SCAN so no truncation occurs), merges the
+ * results across all chunks with first-seen deduplication, then applies a single
+ * global priority-budget pass to select the best MAX_TOKENS identifiers.
+ *
+ * Returns `{ kept, dropped }` where `dropped` is the count of identifiers that
+ * survived extraction across all pages but did not fit in the MAX_TOKENS budget.
+ *
+ * Does NOT mutate the behaviour of `extractFactSheetTokens` or `factSheetText`.
+ */
+export function extractFactSheetTokensAllPages(
+  text: string,
+  charsPerPage: number,
+): { kept: string[]; dropped: number } {
+  const seen = new Set<string>();
+  const all: string[] = [];
+
+  // Walk the text in page-sized chunks. Each chunk is ≤ charsPerPage < MAX_SCAN,
+  // so extractFactSheetTokens will not truncate within a chunk.
+  const pageCount = Math.max(1, Math.ceil(text.length / charsPerPage));
+  for (let i = 0; i < pageCount; i++) {
+    const chunk = text.slice(i * charsPerPage, (i + 1) * charsPerPage);
+    for (const tok of extractFactSheetTokens(chunk)) {
+      if (!seen.has(tok)) {
+        seen.add(tok);
+        all.push(tok);
+      }
+    }
+  }
+
+  // Re-apply the global priority budget so a tier-0 identifier on page 5
+  // is never evicted by many tier-1 tokens from page 1.
+  const ranked = all
+    .map((t) => ({ t, tier: priorityTier(t) }))
+    .sort((a, b) => a.tier - b.tier || b.t.length - a.t.length || (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
+  const kept: string[] = [];
+  let urls = 0;
+  for (const { t, tier } of ranked) {
+    if (kept.length >= MAX_TOKENS) break;
+    if (tier === 2 && urls++ >= MAX_URLS) continue;
+    kept.push(t);
+  }
+
+  return { kept, dropped: all.length - kept.length };
+}
+
 const OPEN =
   '[Exact identifiers from the rendered context above (paths, ids, versions, numbers) — quote these verbatim instead of transcribing them from the image: ';
 
+/** Build the one-line fact-sheet string from a pre-extracted token list. */
+export function factSheetTextFromTokens(tokens: string[]): string {
+  return tokens.length > 0 ? OPEN + tokens.join(' · ') + ']' : '';
+}
+
 /** One-line fact-sheet string for `text`, or `''` when nothing notable was found. */
 export function factSheetText(text: string): string {
-  const toks = extractFactSheetTokens(text);
-  return toks.length > 0 ? OPEN + toks.join(' · ') + ']' : '';
+  return factSheetTextFromTokens(extractFactSheetTokens(text));
 }

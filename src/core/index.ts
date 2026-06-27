@@ -17,10 +17,14 @@ export {
 } from './measurement.js';
 export {
   transformAnthropicMessages,
+  renderTextToImages,
   type PxpipeOptions,
   type PxpipeReason,
   type PxpipeTransformInput,
   type PxpipeTransformResult,
+  type RenderTextToImagesOptions,
+  type RenderedTextImage,
+  type RenderTextToImagesResult,
 } from './library.js';
 export {
   transformRequest,

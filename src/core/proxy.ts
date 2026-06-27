@@ -672,7 +672,11 @@ export function createProxy(config: ProxyConfig = {}) {
         const modelOk = isMessages
           ? isPxpipeSupportedModel(model)
           : isPxpipeSupportedGptModel(model);
-        const effectiveOpts = modelOk ? transformOpts : { ...transformOpts, compress: false };
+        // Unsupported model → a true passthrough: no break-even compression
+        // (a text-only model may not accept injected image blocks at all).
+        const effectiveOpts = modelOk
+          ? transformOpts
+          : { ...transformOpts, compress: false };
         const r = isMessages
           ? await transformRequest(bodyIn, effectiveOpts)
           : isOpenAIChat

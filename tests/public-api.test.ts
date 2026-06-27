@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   buildCountTokensBodies,
   getAllowedModelBases,
@@ -12,6 +12,21 @@ import {
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
+
+// Tests below assert DEFAULT model-scope behavior, which assumes PXPIPE_MODELS is unset.
+// Snapshot and clear any ambient value (e.g. a dev shell that still exports PXPIPE_MODELS)
+// before each test so the suite is deterministic regardless of the environment it runs in,
+// then restore the original afterward. The per-test override cases still work: they see an
+// unset var, set their own value, and clean up.
+let ambientPxpipeModels: string | undefined;
+beforeEach(() => {
+  ambientPxpipeModels = process.env.PXPIPE_MODELS;
+  delete process.env.PXPIPE_MODELS;
+});
+afterEach(() => {
+  if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
+  else process.env.PXPIPE_MODELS = ambientPxpipeModels;
+});
 
 describe('public library API', () => {
   it('recognizes Fable 5 (with suffix aliases) as the default scope; Opus is OFF by default', () => {

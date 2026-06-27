@@ -255,7 +255,35 @@ export function measureLineCols(line: string, markerScale: number = 1): number {
 /** Always renders at full canvas width. Signature kept for transform.ts compatibility; returns cols unchanged. */
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function shrinkColsToContent(text: string, cols: number, markerScale: number = 1): number {
-  return Math.max(1, cols | 0);
+  // Real content-width measurement — delegates to measureContentCols (was historically a
+  // no-op stub). The proxy's cost gate AND renderer both call this, so sizing the canvas to
+  // the widest line here makes the proxy match the SDK/export path (renderTextToImages),
+  // which already uses measureContentCols. Never narrows below the widest line ⇒ row count
+  // (and thus image/paging count) is unchanged; only the canvas WIDTH (pixel cost) drops.
+  return measureContentCols(text, cols, markerScale);
+}
+
+/**
+ * Real content-width measurement (the capability `shrinkColsToContent` historically
+ * stubbed out): the display width, in cols, of the widest line in `text`, capped at
+ * `maxCols`. Lets a renderer size a narrow canvas to short-line content (e.g. code)
+ * instead of padding every page to full width. Pure function of (text, maxCols) →
+ * deterministic width → cache-prefix-safe. Tabs are expanded so the measured width
+ * matches what the renderer actually lays out.
+ */
+export function measureContentCols(text: string, maxCols: number, markerScale: number = 1): number {
+  const cap = Math.max(1, maxCols | 0);
+  let widest = 1;
+  let start = 0;
+  for (let i = 0; i <= text.length; i++) {
+    if (i === text.length || text[i] === '\n') {
+      const w = measureLineCols(expandTabsInLine(text.slice(start, i)), markerScale);
+      if (w > widest) widest = w;
+      if (widest >= cap) return cap;
+      start = i + 1;
+    }
+  }
+  return Math.min(cap, widest);
 }
 
 export function wrapLines(text: string, cols: number, markerScale: number = 1): string[] {
@@ -851,4 +879,61 @@ export async function renderTextToPngsReflowMultiCol(
 ): Promise<RenderedImage[]> {
   const packed = reflow(text);
   return renderTextToPngsMultiCol(packed ?? text, cols, numCols);
+}
+
+export interface RenderDensePagesOptions {
+  /** Wrap-width cap in cols. Default DENSE_CONTENT_COLS (384). */
+  readonly cols?: number;
+  /** Shrink the canvas to the widest actual line (default true). `false` keeps the full
+   *  `cols` width — the proxy's eval-backed full-canvas / slab behavior. */
+  readonly shrink?: boolean;
+  /** Columns to pack side-by-side. `'auto'` (default) packs as many as fit the width cap;
+   *  a number forces that count. Collapses to 1 when the canvas shrinks below the cap. */
+  readonly multiCol?: number | 'auto';
+  /** Reflow (minify + join hard newlines with ↵) before rendering. Default false. Callers
+   *  that pre-reflow (the proxy's maybeReflow / history lockstep) pass false; `pxpipe export`
+   *  passes true so short lines pack into full-width rows. */
+  readonly reflow?: boolean;
+  /** Max source chars per page. Default DENSE_CONTENT_CHARS_PER_IMAGE. */
+  readonly maxCharsPerImage?: number;
+  /** Render style. Default DENSE_RENDER_STYLE. */
+  readonly style?: RenderStyle;
+  /** Max page height in px. Default MAX_HEIGHT_PX. */
+  readonly maxHeightPx?: number;
+}
+
+/**
+ * The single dense-page rendering decision shared by the public SDK primitive
+ * `renderTextToImages` (library.ts → `pxpipe export`) AND the proxy's `textToImageBlocks`
+ * (transform.ts): optionally reflow, measure the content width, pack as many side-by-side
+ * columns as actually fit the width cap (or honor an explicit count, collapsing the wasted
+ * divider column when the canvas shrinks), then render. Both callers route through HERE so
+ * export PNGs and proxy image blocks are produced by the exact same code and cannot drift —
+ * `shrinkColsToContent` is `measureContentCols`, so the proxy's old inline path was already
+ * identical at the default 384 cols; this makes it identical at every cols. Returns the raw
+ * rendered pages; each caller packages them (PNG files vs. base64 Anthropic ImageBlocks).
+ *
+ * History (history.ts) deliberately does NOT use this: it reflows a parallel role-slot string
+ * in lockstep with the text and renders with `colorByRole`, which code export has no concept
+ * of — wiring slots through this public surface would bloat it for one internal caller. It
+ * still shares the underlying `reflow()` + `renderTextToPngsWithCharLimit` primitives.
+ */
+export async function renderDensePages(
+  text: string,
+  opts: RenderDensePagesOptions = {},
+): Promise<RenderedImage[]> {
+  const source = opts.reflow ? reflow(text) ?? text : text;
+  const maxCols = Math.max(1, (opts.cols ?? DENSE_CONTENT_COLS) | 0);
+  const cols = opts.shrink === false ? maxCols : measureContentCols(source, maxCols);
+  const requestedCols =
+    opts.multiCol === undefined || opts.multiCol === 'auto'
+      ? Math.max(1, maxFittingCols(cols))
+      : Math.max(1, opts.multiCol | 0);
+  const numCols = cols < maxCols ? 1 : requestedCols;
+  const style = opts.style ?? DENSE_RENDER_STYLE;
+  const maxChars = opts.maxCharsPerImage ?? DENSE_CONTENT_CHARS_PER_IMAGE;
+  const maxHeightPx = opts.maxHeightPx ?? MAX_HEIGHT_PX;
+  return numCols > 1
+    ? renderTextToPngsMultiCol(source, cols, numCols)
+    : renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
 }

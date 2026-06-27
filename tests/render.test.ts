@@ -1983,16 +1983,18 @@ describe('transform', () => {
     expect(isCompressionProfitable(dense, 100)).toBe(true);
   });
 
-  it('isCompressionProfitable(string, cols, cap): truncation cap lets sparse log become profitable', () => {
-    // For tool_result paging — actual image cost is bounded by maxImagesPerToolResult
-    // while the SAVED text is the full pre-truncation length. Sparse content
-    // (10k short lines) wastes canvas at full width, so uncapped it's a loss;
-    // with cap=10 the image side is bounded and we win.
+  it('isCompressionProfitable(string, cols, cap): sparse log shrinks to content width and profits; cap still bounds image cost', () => {
+    // 10k short log lines. PRE-SHRINK this was priced at the full 100-col canvas
+    // width and was an uncapped LOSS. Now shrinkColsToContent (→ measureContentCols)
+    // sizes the canvas to the widest line (~22 cols), so the wasted width is gone and
+    // the sparse content profits even uncapped — the same gate/renderer geometry the
+    // SDK/export path uses. The cap (maxImagesPerToolResult) still bounds the image
+    // side for paging; it remains profitable.
     const lines: string[] = [];
     for (let i = 0; i < 10_000; i++) lines.push(`log entry ${i} payload`);
     const log = lines.join('\n');
-    expect(isCompressionProfitable(log, 100)).toBe(false); // sparse → image cost exceeds text
-    expect(isCompressionProfitable(log, 100, 10)).toBe(true); // capped, profits
+    expect(isCompressionProfitable(log, 100)).toBe(true); // shrink kills wasted width → profitable
+    expect(isCompressionProfitable(log, 100, 10)).toBe(true); // capped, still profits
   });
 
   it('isCompressionProfitable: 7x10 atlas lets 15k blocks become 1-image wins', () => {
