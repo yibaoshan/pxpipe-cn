@@ -2,6 +2,7 @@
 // Presentation only; server code (src/dashboard.ts, src/node.ts) needs no edits.
 
 import { HTMX_JS, ALPINE_JS } from './vendor.js';
+import { CACHE_CREATE_RATE, CACHE_READ_RATE } from '../core/baseline.js';
 import type {
   StatsPayload,
   RecentPayload,
@@ -489,12 +490,25 @@ export function renderRecentFragment(p: RecentPayload): string {
                 ? `<a class="row-view" href="#" hx-get="/fragments/context-map?req=${viewId}" hx-target="#frag-context-map" hx-swap="innerHTML">Details →</a>`
                 : `<span class="muted">—</span>`;
             const saved = e.session_saved_so_far_delta;
+            // A loss that disappears when the newly written prefix is repriced at
+            // the read rate is just the one-time cache-create premium — the
+            // purchase price of the cheap cache reads on the turns that follow.
+            // Mark it so create turns don't read as gate failures.
+            const cc = e.cache_create ?? 0;
+            const createLoss =
+              saved != null &&
+              saved < 0 &&
+              cc > 0 &&
+              saved + cc * (CACHE_CREATE_RATE - CACHE_READ_RATE) > 0;
+            const createNote = createLoss
+              ? ` <span class="mk-create" title="Cache-create turn: this loss is the one-time ${CACHE_CREATE_RATE}× premium for writing ${numFmt(cc)} tokens to cache. Later turns re-read that prefix at ${CACHE_READ_RATE}×, which typically recoups it.">create</span>`
+              : '';
             const savedCell = saved == null
               ? `<td class="num muted">—</td>`
               : saved > 0
                 ? `<td class="num pos">${numFmt(saved)}</td>`
                 : saved < 0
-                  ? `<td class="num neg">${numFmt(saved)}</td>`
+                  ? `<td class="num neg">${numFmt(saved)}${createNote}</td>`
                   : `<td class="num">0</td>`;
             const imaged = e.cc_added
               ? `<span class="badge badge-img">image</span>`
@@ -909,6 +923,8 @@ const CSS = `
   .pill-warn { background: var(--warn-tint); color: var(--warn); }
   .pill-bad { background: var(--bad-tint); color: var(--bad); }
   .badge { font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 999px; }
+  .mk-create { font-size: 9.5px; font-weight: 700; color: var(--muted); border: 1px solid var(--muted);
+    border-radius: 999px; padding: 0 5px; margin-left: 4px; vertical-align: 1px; cursor: help; white-space: nowrap; }
   .badge-img { background: var(--img-tint); color: var(--img-ink); }
   .badge-txt { background: var(--txt-tint); color: var(--txt-ink); }
 
