@@ -112,6 +112,16 @@ export interface TrackEvent {
   /** Server-side web search calls billed per-request (not per-token). */
   web_search_requests?: number;
 
+  /** Model stop reason ("end_turn", "tool_use", "max_tokens", "refusal", …).
+   *  OpenAI finish_reason ("stop", "length", "content_filter", …) lands in the same field. */
+  stop_reason?: string;
+  /** True when the stop reason indicates a safety classifier fired ("refusal" /
+   *  "content_filter"). Refusal rows emit almost no output and would otherwise
+   *  read as "cheap" — scorers MUST fail cost comparisons on these rows, and a
+   *  cluster of them after a transform change means the imaged prompt itself is
+   *  tripping the classifier (see transform.ts reasoning_extraction notes). */
+  safety_flagged?: boolean;
+
   /** Ground-truth output chars measured by streaming the response body ourselves — independent of
    *  usage.output_tokens. redacted_block_count_measured counts opaque server-encrypted blocks;
    *  dashboard applies a low/mid/high estimate for those. Absent on non-scannable responses. */
@@ -299,8 +309,15 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (m.redactedBlockCount > 0)
       out.redacted_block_count_measured = m.redactedBlockCount;
   }
+  if (ev.stopReason) {
+    out.stop_reason = ev.stopReason;
+    if (SAFETY_STOP_REASONS.has(ev.stopReason)) out.safety_flagged = true;
+  }
   return out;
 }
+
+/** Stop reasons that mean a safety classifier fired (Anthropic / OpenAI spellings). */
+const SAFETY_STOP_REASONS = new Set(['refusal', 'content_filter']);
 
 /** Writes one JSON line per event. Worker host uses console.log; Node host uses a file-backed variant. */
 export class JsonLogTracker implements Tracker {

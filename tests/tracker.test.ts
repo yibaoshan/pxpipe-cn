@@ -195,6 +195,44 @@ describe('toTrackEvent', () => {
     expect(out.cwd).toBeUndefined();
     expect(out.input_tokens).toBeUndefined();
   });
+
+  it('maps stopReason → stop_reason without flagging benign reasons', () => {
+    const out = toTrackEvent({
+      method: 'POST',
+      path: '/v1/messages',
+      status: 200,
+      durationMs: 10,
+      stopReason: 'end_turn',
+    });
+    expect(out.stop_reason).toBe('end_turn');
+    expect(out.safety_flagged).toBeUndefined();
+  });
+
+  it.each(['refusal', 'content_filter'])(
+    'sets safety_flagged for stop reason %s',
+    (reason) => {
+      const out = toTrackEvent({
+        method: 'POST',
+        path: '/v1/messages',
+        status: 200,
+        durationMs: 10,
+        stopReason: reason,
+      });
+      expect(out.stop_reason).toBe(reason);
+      expect(out.safety_flagged).toBe(true);
+    },
+  );
+
+  it('omits stop_reason entirely when the event has none', () => {
+    const out = toTrackEvent({
+      method: 'POST',
+      path: '/v1/messages',
+      status: 200,
+      durationMs: 10,
+    });
+    expect('stop_reason' in out).toBe(false);
+    expect('safety_flagged' in out).toBe(false);
+  });
 });
 
 describe('JsonLogTracker', () => {

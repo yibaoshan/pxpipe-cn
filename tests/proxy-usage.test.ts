@@ -1230,4 +1230,160 @@ describe('proxy usage extraction', () => {
     expect(captured).toBeDefined();
     expect(captured!.measurement?.textChars).toBe(8);
   });
+
+  it('extracts stop_reason from the SSE message_delta event', async () => {
+    const sseBody =
+      'event: message_start\n' +
+      'data: {"type":"message_start","message":{"id":"x","type":"message","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":1}}}\n\n' +
+      'event: content_block_delta\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n' +
+      'event: message_delta\n' +
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":9}}\n\n' +
+      'event: message_stop\n' +
+      'data: {"type":"message_stop"}\n\n';
+
+    const restore = mockUpstream(
+      () =>
+        new Response(sseBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        }),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      transform: {},
+      onRequest: (e) => { captured = e; },
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: SAMPLE_REQ_BODY,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured).toBeDefined();
+    expect(captured!.stopReason).toBe('end_turn');
+    // message_delta output_tokens must win over message_start's placeholder 1.
+    expect(captured!.usage?.output_tokens).toBe(9);
+  });
+
+  it('extracts stop_reason "refusal" from a non-stream JSON response', async () => {
+    const restore = mockUpstream(
+      () =>
+        new Response(
+          JSON.stringify({
+            id: 'msg_r',
+            type: 'message',
+            role: 'assistant',
+            content: [],
+            stop_reason: 'refusal',
+            usage: { input_tokens: 5, output_tokens: 2 },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      transform: {},
+      onRequest: (e) => { captured = e; },
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: SAMPLE_REQ_BODY,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured).toBeDefined();
+    expect(captured!.stopReason).toBe('refusal');
+  });
+
+  it('extracts OpenAI choices[].finish_reason from a JSON body', async () => {
+    const restore = mockUpstream(
+      () =>
+        new Response(
+          JSON.stringify({
+            id: 'chatcmpl-1',
+            object: 'chat.completion',
+            choices: [
+              {
+                index: 0,
+                message: { role: 'assistant', content: '' },
+                finish_reason: 'content_filter',
+              },
+            ],
+            usage: { prompt_tokens: 11, completion_tokens: 3 },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      transform: {},
+      onRequest: (e) => { captured = e; },
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: SAMPLE_REQ_BODY,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured).toBeDefined();
+    expect(captured!.stopReason).toBe('content_filter');
+  });
+
+  it('leaves stopReason undefined when the stream never ships one', async () => {
+    const sseBody =
+      'event: message_start\n' +
+      'data: {"type":"message_start","message":{"id":"x","type":"message","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":1}}}\n\n' +
+      'event: message_stop\n' +
+      'data: {"type":"message_stop"}\n\n';
+
+    const restore = mockUpstream(
+      () =>
+        new Response(sseBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        }),
+    );
+
+    let captured: ProxyEvent | undefined;
+    const proxy = createProxy({
+      transform: {},
+      onRequest: (e) => { captured = e; },
+    });
+
+    const res = await proxy(
+      new Request('http://localhost/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: SAMPLE_REQ_BODY,
+      }),
+    );
+    await res.text();
+    await new Promise((r) => setTimeout(r, 20));
+    restore();
+
+    expect(captured).toBeDefined();
+    expect(captured!.stopReason).toBeUndefined();
+  });
 });
