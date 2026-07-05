@@ -127,6 +127,13 @@ function parseProvider(v: string | undefined): 'cloudflare-ai-gateway' | undefin
   process.exit(2);
 }
 
+/** PXPIPE_USAGE_PROBE_RATE → [0, 1]; invalid/absent → 0 (probe off). */
+function clampSampleRate(v: string | undefined): number {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(1, n);
+}
+
 function printHelp(): void {
   console.log(`pxpipe — token-saving proxy for Claude Code
 
@@ -165,6 +172,10 @@ Environment:
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
                           supports {"models": [...]} or {"models": "off"}
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
+  PXPIPE_USAGE_PROBE_RATE 0–1: when the upstream lacks count_tokens (relays),
+                          sample this fraction of requests with a BILLED
+                          max_tokens=1 replay to measure baseline_tokens.
+                          Default 0 (off); 0.02–0.05 recommended.
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
 
@@ -947,6 +958,10 @@ async function main(): Promise<void> {
       // Active path: use DEFAULTS in transform.ts for break-even gating.
       return {};
     },
+    // Relay upstreams commonly 404 count_tokens; opt into the sampled
+    // max_tokens=1 usage-replay baseline instead. Billed per probe — keep
+    // the rate low (0.02–0.05). Invalid/absent → 0 (off).
+    usageProbeSampleRate: clampSampleRate(process.env.PXPIPE_USAGE_PROBE_RATE),
     onRequest: async (e) => {
       // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips
       // info.firstImagePng, so capturing has to happen on the raw event.

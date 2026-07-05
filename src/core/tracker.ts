@@ -145,6 +145,9 @@ export interface TrackEvent {
   baseline_cacheable_tokens?: number;
   /** Probe outcome. Dashboards must only attribute "$ saved" to rows where status === 'ok'. */
   baseline_probe_status?: 'ok' | 'partial' | 'failed';
+  /** How the baseline was measured: free count_tokens (default) or the sampled
+   *  max_tokens=1 usage replay (relay upstreams without count_tokens). */
+  baseline_probe_method?: 'count_tokens' | 'usage_sample';
 
   // Errors:
   error?: string;
@@ -286,6 +289,9 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.baselineProbeStatus !== undefined) {
       out.baseline_probe_status = info.baselineProbeStatus;
+    }
+    if (info.baselineProbeMethod !== undefined) {
+      out.baseline_probe_method = info.baselineProbeMethod;
     }
   }
   if (env) {

@@ -9,6 +9,8 @@ import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedMo
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
+  buildUsageProbeBody,
+  buildCacheablePrefixUsageProbeBody,
 } from './measurement.js';
 import type { Usage } from './types.js';
 
@@ -31,6 +33,12 @@ export interface ProxyConfig {
   /** Pass a function to inject dynamic values per-request (e.g. live charsPerToken);
    *  static object for Workers/tests. */
   transform?: TransformOptions | (() => TransformOptions);
+  /** Baseline probe when the upstream 404s /v1/messages/count_tokens (relay
+   *  upstreams commonly do): replay the pre-compression body at max_tokens=1
+   *  and read the billed usage block instead. NOT free (full input price per
+   *  probe), so it fires on a random sample of compressed requests. 0 = off
+   *  (default). 0.02–0.05 is plenty for savings estimation. */
+  usageProbeSampleRate?: number;
   /** Called after every request — useful for logging / metrics in the host. */
   onRequest?: (event: ProxyEvent) => void | Promise<void>;
 }
@@ -552,6 +560,42 @@ async function countTokensUpstream(
   }
 }
 
+/** POST a max_tokens=1 replay to /v1/messages and read the billed usage block —
+ *  the relay-compatible fallback when count_tokens 404s (relays commonly route
+ *  only /v1/messages). Baseline = input + cache_create + cache_read (probe
+ *  bodies are cache_control-stripped, so the cache terms are normally 0, but
+ *  summing keeps the number honest if the upstream caches anyway). NOT free —
+ *  callers sample. Relay-scaled counts are fine: the actual request's usage is
+ *  scaled by the same factor, so the saved RATIO is scale-invariant. */
+async function usageProbeUpstream(
+  messagesUrl: string,
+  body: Uint8Array,
+  headers: Headers,
+): Promise<number | null> {
+  try {
+    const res = await fetch(messagesUrl, {
+      method: 'POST',
+      headers,
+      body: body as unknown as BodyInit,
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as {
+      usage?: {
+        input_tokens?: unknown;
+        cache_creation_input_tokens?: unknown;
+        cache_read_input_tokens?: unknown;
+      };
+    };
+    const u = json.usage;
+    if (!u || typeof u.input_tokens !== 'number') return null;
+    const cc = typeof u.cache_creation_input_tokens === 'number' ? u.cache_creation_input_tokens : 0;
+    const cr = typeof u.cache_read_input_tokens === 'number' ? u.cache_read_input_tokens : 0;
+    return u.input_tokens + cc + cr;
+  } catch {
+    return null;
+  }
+}
+
 /** Resolve upstream URLs from config. Pure — unit-testable. */
 export function resolveUpstreams(config: ProxyConfig): {
   anthropic: string;
@@ -645,6 +689,7 @@ export function createProxy(config: ProxyConfig = {}) {
           let baselineResolved: number | null = null;
           let cacheableExpected = false;
           let cacheableResolved: number | null = null;
+          let probeMethod: 'count_tokens' | 'usage_sample' = 'count_tokens';
           if (baselinePromise) {
             try {
               baselineResolved = await baselinePromise;
@@ -662,6 +707,38 @@ export function createProxy(config: ProxyConfig = {}) {
               /* probe threw */
             }
           }
+          // Relay fallback: count_tokens failed AND this request drew the
+          // sample → replay at max_tokens=1 and bill the usage block instead.
+          // Runs after the main response (finalize is off the client's path),
+          // so the added latency is invisible; the cost is the sampled probe.
+          if (baselineResolved === null && usageProbeFallback) {
+            try {
+              baselineResolved = await usageProbeUpstream(
+                usageProbeFallback.url,
+                usageProbeFallback.body,
+                usageProbeFallback.headers,
+              );
+              if (baselineResolved !== null) {
+                probeMethod = 'usage_sample';
+                info.baselineTokens = baselineResolved;
+                // cacheable-prefix half rides the same fallback (or stays
+                // absent → 'partial' keeps the row out of cache-aware math).
+                cacheableExpected = usageProbeFallback.cacheableBody !== null;
+                if (usageProbeFallback.cacheableBody) {
+                  cacheableResolved = await usageProbeUpstream(
+                    usageProbeFallback.url,
+                    usageProbeFallback.cacheableBody,
+                    new Headers(usageProbeFallback.headers),
+                  );
+                  if (cacheableResolved !== null) {
+                    info.baselineCacheableTokens = cacheableResolved;
+                  }
+                }
+              }
+            } catch {
+              /* fallback threw — status stays failed */
+            }
+          }
           if (baselineResolved === null) {
             info.baselineProbeStatus = 'failed';
           } else if (cacheableExpected && cacheableResolved === null) {
@@ -669,6 +746,7 @@ export function createProxy(config: ProxyConfig = {}) {
           } else {
             info.baselineProbeStatus = 'ok';
           }
+          if (baselineResolved !== null) info.baselineProbeMethod = probeMethod;
         }
         await config.onRequest?.({
           method: req.method,
@@ -713,6 +791,11 @@ export function createProxy(config: ProxyConfig = {}) {
     let baselinePromise: Promise<number | null> | undefined;
     let baselineCacheablePromise: Promise<number | null> | undefined;
     let baselineStatusApplies = false;
+    // Sampled billed fallback (relay upstreams without count_tokens). Prepared
+    // during transform, fired in finalize only after count_tokens returns null.
+    let usageProbeFallback:
+      | { url: string; body: Uint8Array; cacheableBody: Uint8Array | null; headers: Headers }
+      | undefined;
 
     if (isMessages || isOpenAIChat || isOpenAIResponses) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
@@ -766,6 +849,22 @@ export function createProxy(config: ProxyConfig = {}) {
                 ctCacheableBody,
                 new Headers(ctHeaders),
               );
+            }
+            // Sampled usage-probe fallback for relays that 404 count_tokens.
+            // Decided per-request up front (billed — sampling caps the cost);
+            // fired later in finalize ONLY if count_tokens came back null, so
+            // upstreams with a working count_tokens never pay for it.
+            const sampleRate = config.usageProbeSampleRate ?? 0;
+            if (sampleRate > 0 && Math.random() < sampleRate) {
+              const upBody = buildUsageProbeBody(bodyIn);
+              if (upBody) {
+                usageProbeFallback = {
+                  url: ctBase + url.pathname,
+                  body: upBody,
+                  cacheableBody: buildCacheablePrefixUsageProbeBody(bodyIn),
+                  headers: new Headers(ctHeaders),
+                };
+              }
             }
           }
         }

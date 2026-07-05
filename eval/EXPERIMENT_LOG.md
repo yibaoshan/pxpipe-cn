@@ -276,6 +276,38 @@ events.jsonl telemetry — everything the checklist asks for:
   probe doesn't work against this relay (same auth quirk as count_tokens);
   net-savings-vs-baseline for CN traffic stays estimated from the gate
   model, not probe-measured. Known relay limitation, logged.
+  → **Fixed same day by the sampled usage-probe fallback (next section).**
 
 Verdict: proxy pipeline healthy end-to-end on real CN traffic; telemetry
 fields flow; gate decisions match offline math at gap2 pricing.
+
+## Usage-probe fallback for relays without count_tokens (2026-07-05)
+
+Diagnosis: ergouapi.com 404s `/v1/messages/count_tokens` ("Invalid URL");
+the `/anthropic/...` and `/claude/...` prefix variants return HTTP 200 but
+serve the relay's HTML SPA homepage — no real count_tokens anywhere, so
+baseline_probe_status was permanently 'failed' and CN net savings were
+unmeasurable against this upstream.
+
+Fix: sampled max_tokens=1 replay of the PRE-compression body against
+`/v1/messages` itself, reading the billed usage block as the baseline
+(`input + cache_creation + cache_read`). Same trick as the CPT_CJK
+calibration script, now built into the proxy:
+
+- Opt-in via `PXPIPE_USAGE_PROBE_RATE` (0 = off default; 0.02–0.05 plenty —
+  it costs real input tokens, unlike count_tokens).
+- Fires in finalize(), off the client's latency path, ONLY after
+  count_tokens resolved null — standard upstreams never pay for it.
+- Probe body strips all `cache_control` (no cache pollution / 1.25× write
+  premium) and drops `thinking` (budget_tokens < max_tokens impossible at 1).
+- Cacheable-prefix decomposition preserved: when markers exist, a second
+  truncated probe fills baseline_cacheable_tokens; missing → 'partial'.
+- Telemetry: `baseline_probe_method: 'count_tokens' | 'usage_sample'` on
+  TrackEvent so offline scorers can segment. Relay-scaled counts are fine —
+  ratios vs same-upstream usage are scale-invariant.
+
+Live check (rate=1, one real CN request through the relay):
+`baseline_tokens: 36773, baseline_probe_status: "ok",
+baseline_probe_method: "usage_sample"` in events.jsonl. 9 new vitest cases
+pin body shaping, fire-ordering, sampling gate, and telemetry; full suite
+673/673.

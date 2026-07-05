@@ -158,6 +158,14 @@ pnpm run build                # 重新生成 dist/
 折扣相互抵消，不可能被重复计入"节省"。你可以从事件日志自行重新推导：
 公式与字段名记录在 `src/core/baseline.ts`。
 
+**中转站不支持 count_tokens 怎么办？**
+部分中转对 `/v1/messages/count_tokens` 返回 404，基线探测会一直
+`failed`。可设 `PXPIPE_USAGE_PROBE_RATE=0.05`（默认 0 关闭）开启采样
+兜底：count_tokens 失败后，按该概率把压缩前原文以 `max_tokens=1` 重放
+到 `/v1/messages`，读计费 usage 块作基线。这不免费（按输入价计费），
+故只采样；探测体会剥掉 `cache_control`，不污染缓存。事件行的
+`baseline_probe_method` 字段区分两种测法。
+
 **它到底压缩什么？**
 三类*输入*块，每类都要过盈利性闸门：
 

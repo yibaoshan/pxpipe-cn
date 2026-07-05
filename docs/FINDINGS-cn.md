@@ -131,5 +131,12 @@
 - 真机冒烟已过（2026-07-05）：本地代理 + 真实中文 Claude Code 会话，
   `cjk_fraction`/`cpt_used` 正常流动、0 丢汉字（仅 1 个 emoji）、闸门对
   带行号槽的中文 Read 结果正确判 not_profitable（图片 1.35 vs 文本
-  0.38 tok/char）。注意：中转不支持 baseline_tokens 反事实探测，中文
-  流量净节省暂靠闸门模型估计。
+  0.38 tok/char）。
+- 中转不支持 count_tokens（404 / HTML 假 200），baseline_tokens 反事实
+  探测原本不可测。同日补上 **usage 采样探测**：count_tokens 失败后按
+  `PXPIPE_USAGE_PROBE_RATE`（默认 0 关闭，建议 0.02–0.05）采样，把压缩前
+  原文以 max_tokens=1 重放到 `/v1/messages`，读计费 usage 块作基线
+  （剥 cache_control、去 thinking，finalize 内异步，不占客户端时延）。
+  事件行带 `baseline_probe_method: "usage_sample"` 供离线判分分流；
+  真机验证一次命中（baseline_tokens=36773, status=ok）。中转的 token
+  计数即使整体缩放也不影响结论——与同上游 usage 的比值是尺度不变的。

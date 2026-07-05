@@ -200,6 +200,63 @@ export function countCacheControlMarkers(bytes: BytesLike): number {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Usage-probe bodies (relay-compatible baseline)
+// ---------------------------------------------------------------------------
+//
+// Some relay upstreams 404 /v1/messages/count_tokens. The fallback baseline is
+// a max_tokens=1 replay of the PRE-COMPRESSION body against /v1/messages
+// itself: the billed usage block (input + cache_create + cache_read) is the
+// same "tokens in this body" oracle, measured by the same upstream that bills
+// the real request — so saved ratios stay scale-invariant even when the relay
+// inflates absolute counts. Unlike count_tokens this is NOT free (full input
+// price per probe), so hosts sample it.
+
+/** Fields forwarded on a usage probe. `thinking` is deliberately dropped:
+ *  its budget_tokens must be < max_tokens, impossible at max_tokens=1. */
+const USAGE_PROBE_FIELDS = new Set(['model', 'messages', 'system', 'tools', 'tool_choice']);
+
+/** Deep-copy with every cache_control key removed, so the probe can't create
+ *  cache entries (1.25× write premium) or read the live request's cache. */
+function stripCacheControlDeep(value: unknown): unknown {
+  if (!value || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(stripCacheControlDeep);
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (k === 'cache_control') continue;
+    out[k] = stripCacheControlDeep(v);
+  }
+  return out;
+}
+
+/** Build the max_tokens=1 usage-probe body for the full original request.
+ *  Returns null when the body isn't a parseable Messages request. */
+export function buildUsageProbeBody(bytes: BytesLike): Uint8Array | null {
+  const b = toUint8Array(bytes);
+  try {
+    const obj = JSON.parse(new TextDecoder().decode(b)) as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(obj)) {
+      if (USAGE_PROBE_FIELDS.has(k)) out[k] = stripCacheControlDeep(obj[k]);
+    }
+    if (typeof out.model !== 'string' || !Array.isArray(out.messages)) return null;
+    out.max_tokens = 1;
+    out.stream = false;
+    return new TextEncoder().encode(JSON.stringify(out));
+  } catch {
+    return null;
+  }
+}
+
+/** Usage-probe body for the cacheable prefix (same truncation as the
+ *  count_tokens variant). Null when the original has no cache_control markers
+ *  (cacheable = 0 by definition, no probe needed). */
+export function buildCacheablePrefixUsageProbeBody(bytes: BytesLike): Uint8Array | null {
+  const truncated = buildCacheablePrefixCountTokensBody(bytes);
+  if (truncated == null) return null;
+  return buildUsageProbeBody(truncated);
+}
+
 function countCacheControlValue(value: unknown): number {
   if (!value || typeof value !== 'object') return 0;
   let n = hasCacheControl(value) ? 1 : 0;

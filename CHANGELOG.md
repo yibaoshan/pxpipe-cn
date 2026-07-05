@@ -27,6 +27,13 @@ behavioral changes, patch = fixes).
   to upstream.
 - **Telemetry:** `cjk_fraction` / `cpt_used` on TrackEvent for ongoing
   recalibration from events.jsonl.
+- **Usage-probe baseline fallback** for relay upstreams without
+  count_tokens: when the free count_tokens probe fails, a sampled
+  (`PXPIPE_USAGE_PROBE_RATE`, default 0/off) max_tokens=1 replay of the
+  pre-compression body against `/v1/messages` reads the billed usage block
+  as `baseline_tokens` (cache_control stripped, thinking dropped, fired in
+  finalize off the latency path). `baseline_probe_method`
+  (`count_tokens` | `usage_sample`) lands on TrackEvent.
 - **CN eval suite:** `eval/eval-cn-needle.mjs`, `eval/eval-cn-gist.mjs`,
   `scripts/cn-baseline.mjs`, `scripts/calibrate-cn-cpt.mjs`, CN corpus
   extraction (`--cjk`), offline `tests/cn.test.ts` (atlas coverage, cell

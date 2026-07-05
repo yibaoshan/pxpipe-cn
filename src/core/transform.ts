@@ -667,6 +667,11 @@ export interface TransformInfo {
    *  didn't (exclude from rollup — cacheable=0 fallback is dishonest). 'failed': no
    *  baseline. undefined: no probe attempted. */
   baselineProbeStatus?: 'ok' | 'partial' | 'failed';
+  /** How the baseline was measured. 'count_tokens': the free endpoint (default).
+   *  'usage_sample': sampled max_tokens=1 replay against /v1/messages — the
+   *  fallback when the upstream (relays) 404s count_tokens. Its absolute counts
+   *  may be upstream-scaled; ratios vs the same upstream's usage stay valid. */
+  baselineProbeMethod?: 'count_tokens' | 'usage_sample';
 }
 
 // --- helpers ---------------------------------------------------------------
