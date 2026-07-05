@@ -1,120 +1,120 @@
-# pxpipe
+# pxpipe-cn
 
-**Cut Claude Code's input tokens by rendering bulky context as images — the same system prompt, tool docs, and history, in a fraction of the tokens.**
+> 本仓库 fork 自 [teamchong/pxpipe](https://github.com/teamchong/pxpipe)，是更适合中国宝宝体质的中文适配版本。
+> 上游对 CJK 内容仅做保守处理，本 fork 的目标是补齐中文场景：CJK 字形渲染、中文 token 密度校准与中文文档（见[中文适配 Roadmap](#中文适配-roadmap)）。当前代码同步至上游 v0.8.0。
+> English original: [README.en.md](README.en.md)
 
-An image's token cost is fixed by its pixel dimensions, not by how much text
-is inside it. Dense content (code, JSON, tool output) packs ~3.1 chars per
-image-token vs ~1 char per text-token on real Claude Code traffic. pxpipe is
-a local proxy that exploits the gap: it rewrites the bulky parts of each
-request into compact PNGs before it leaves your machine. At current Fable
-list prices that lands as a **~59–70% lower end-to-end bill** — but prices
-move and workloads differ, so the durable number is the token cut itself,
-measured per-request against a free `count_tokens` counterfactual in
-`~/.pxpipe/events.jsonl`.
+**把 Claude Code 请求里臃肿的上下文渲染成图片，从而削减输入 token —— 同样的系统提示词、工具文档和历史记录，只花一小部分 token。**
 
-This is what the model sees instead of text:
+图片的 token 费用由像素尺寸决定，与图里装了多少文字无关。在真实的
+Claude Code 流量上，密集内容（代码、JSON、工具输出）以图片计费约合
+3.1 字符/token，而按文本计费约为 1 字符/token。pxpipe 是一个本地代理，
+利用的正是这个差价：它在每个请求离开你的机器之前，把其中臃肿的部分改写成
+高密度 PNG。按当前 Fable 定价，端到端账单约能降低 **59–70%** ——
+但价格会变、负载各异，真正可靠的指标是 token 削减量本身：每个请求都会
+与一次免费的 `count_tokens` 反事实探测对照，逐条记录在
+`~/.pxpipe/events.jsonl` 中。
 
-![example: a real `transformRequest` output: system prompt + tool docs reflowed into one dense 1573×1248 page, instruction banner on top, ↵ marking original newlines](https://raw.githubusercontent.com/teamchong/pxpipe/main/docs/assets/example-render.png)
+模型实际看到的不是文本，而是这样的页面：
 
-*~48k chars of system prompt + tool docs: ≈25k tokens as text, ≈2.7k image
-tokens as this page. Real pipeline output; the model reads renders like this
-at 100/100 (see benchmarks).*
+![示例：一次真实的 transformRequest 输出——系统提示词 + 工具文档重排为一张 1573×1248 的密集页面，顶部是指令横幅，↵ 标记原始换行](https://raw.githubusercontent.com/teamchong/pxpipe/main/docs/assets/example-render.png)
 
-## Demo
+*约 4.8 万字符的系统提示词 + 工具文档：按文本计费约 2.5 万 token，
+渲染成这张页面后约 2700 个图片 token。这是真实管线的输出；模型阅读
+这类渲染页的准确率为 100/100（见下文基准测试）。*
 
-**Fable 5 (the default, 100/100 reader) — plain left, pxpipe right:**
+## 演示
+
+**Fable 5（默认启用，阅读准确率 100/100）—— 左边原生，右边 pxpipe：**
 
 https://github.com/user-attachments/assets/1c8ee63a-fcd7-4958-917b-da788d718349
 
-pxpipe counts an exact token **10/10** across 39 imaged filler files
-(matches `grep` line-for-line), gets the multi-step ledger arithmetic right,
-and ends the session at **$6.06** with context to spare (73.5k/1M) vs
-**$42.21** at 96% full. One caveat visible in the clip: the pxpipe arm
-needed a nudge to match the requested one-line output format.
+pxpipe 一侧在 39 个已图片化的填充文件中数出了精确的 token 计数
+**10/10**（与 `grep` 逐行一致），多步账目算术也全部正确，
+会话结束时花费 **$6.06**、上下文余量充足（73.5k/1M）；原生一侧花费
+**$42.21**、上下文占用 96%。片中可见的一个瑕疵：pxpipe 一侧需要
+提醒一次才按要求输出单行格式。
 
-**Opus 4.8 (disabled by default) — same layout:**
+**Opus 4.8（默认关闭）—— 相同布局：**
 
 https://github.com/user-attachments/assets/f4e50137-31b5-426f-a6ed-b83f829b4a2c
 
-Text needles read fine on both arms; the imaged phrase-count doesn't read on
-Opus — and pxpipe **says so instead of fabricating a number**. That misread
-rate is why Opus is opt-in.
+文本 needle 两侧都能正常读出；图片化的短语计数在 Opus 上读不出来 ——
+此时 pxpipe **会明说读不出，而不是编造一个数字**。正是这个误读率
+让 Opus 被设为需手动开启。
 
-## Try it (30 seconds)
+## 上手（30 秒）
 
 ```bash
-npx pxpipe-proxy                                  # proxy on 127.0.0.1:47821
-ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude  # point Claude Code at it
+npx pxpipe-proxy                                  # 代理监听 127.0.0.1:47821
+ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude  # 让 Claude Code 走这个代理
 ```
 
-Dashboard at <http://127.0.0.1:47821/>: tokens saved, every text→image
-conversion side by side, kill switch, live model chips. Responses stream
-normally — pxpipe compresses the *request* only, never the model's output.
-Recent turns stay text; the system prompt, tool docs, and older bulk history
-are imaged.
+仪表盘在 <http://127.0.0.1:47821/>：已节省的 token、每次文本→图片
+转换的逐条对照、总开关、实时模型芯片。响应正常流式返回 ——
+pxpipe 只压缩*请求*，从不动模型的输出。最近的对话轮保持文本；
+系统提示词、工具文档和较早的大块历史会被图片化。
 
-## The honest part
+## 有话直说
 
-- **It is lossy.** Exact 12-char hex strings in dense imaged content:
-  **13/15** on Fable 5, **0/15** on Opus — and misses are *silent
-  confabulations*, not errors. Byte-exact values (IDs, hashes, secrets)
-  must stay text; recent turns do. A dedicated verbatim-risk guard is not
-  built yet.
-- **Escape hatch:** subagents on non-allowlisted models pass through as
-  text — route byte-exact work there
-  (`CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6`, or `model: sonnet` in
-  agent frontmatter).
-- **Real work:** SWE-bench Lite pilot **10/10 both arms** at −65% request
-  size; SWE-bench Pro **14/19 ON vs 15/19 OFF** at −60%, verdicts agree
-  18/19, and the single split re-resolved 3/3 on replication — run-to-run
-  variance, not compression. Small n; receipts in `eval/`.
-- **Workload-dependent.** Wins on token-dense content (~1 char/token),
-  loses money on sparse prose (~3.5 chars/token); a profitability gate
-  (calibrated on N=391 production rows) images only where the math wins.
-- **Model scope:** default `PXPIPE_MODELS=claude-fable-5,gpt-5.6`. Opus
-  4.7/4.8 misread ~7% of renders and GPT 5.5 degrades on imaged context, so
-  both are opt-in via `PXPIPE_MODELS` or the dashboard chips.
-  `PXPIPE_MODELS=off` disables imaging. Everything else passes through
-  byte-identical. On the GPT path, tool definitions stay native JSON and no
-  Anthropic `cache_control` markers are used.
+- **这是有损压缩。** 在密集图片化内容里回读精确的 12 位十六进制串：
+  Fable 5 为 **13/15**，Opus 为 **0/15** —— 而且读错时是*悄无声息的
+  编造*，不会报错。要求逐字节精确的值（ID、哈希、密钥）必须留在文本里；
+  最近的对话轮本来就是文本。专门的逐字风险防护尚未实现。
+- **逃生通道：** 运行在允许列表之外模型上的子代理会以纯文本直通 ——
+  把逐字节精确的工作路由过去即可
+  （`CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6`，或在 agent
+  frontmatter 里写 `model: sonnet`）。
+- **真实任务：** SWE-bench Lite 试点两侧均 **10/10**，请求体积 −65%；
+  SWE-bench Pro 开启 **14/19** vs 关闭 **15/19**，体积 −60%，19 例中
+  18 例判定一致，唯一的分歧样本复测 3/3 全部解出 —— 属于运行间方差，
+  不是压缩所致。样本量小；凭据在 `eval/`。
+- **收益取决于负载。** 在 token 密集内容（约 1 字符/token）上赚，
+  在稀疏散文（约 3.5 字符/token）上赔；一个盈利性闸门
+  （基于 N=391 条生产数据校准）只在数学上划算时才图片化。
+- **模型范围：** 默认 `PXPIPE_MODELS=claude-fable-5,gpt-5.6`。
+  Opus 4.7/4.8 约有 7% 的渲染页误读，GPT 5.5 在图片化上下文上表现
+  下降，因此两者都需通过 `PXPIPE_MODELS` 或仪表盘芯片手动开启。
+  `PXPIPE_MODELS=off` 可完全禁用图片化。其余一切逐字节直通。
+  GPT 路径上，工具定义保持原生 JSON，也不会使用 Anthropic 的
+  `cache_control` 标记。
 
-## Benchmarks (reproducible)
+## 基准测试（可复现）
 
-Measured with novel random-number problems the model cannot have memorized:
+使用模型不可能背过的新造随机数题目测得：
 
-| test | N | text | pxpipe (image) | tokens |
+| 测试 | N | 文本 | pxpipe（图片） | token |
 |---|---:|---:|---:|---|
-| novel arithmetic, `claude-fable-5` | 100 | 100% | **100%** | **−38%** |
-| novel arithmetic, `claude-opus-4-8` | 100 | 100% | 93% | −38% |
-| gist recall A/B (decisions, values, paths, names, negations; with distractors; 15k-45k char sessions), Fable 5 | 98/arm | 98/98 | **98/98** | - |
-| state tracking (value mutated 3x, final/first/count), Fable 5 | 18/arm | 18/18 | **18/18** | - |
-| confabulation on never-stated facts (lower is better), Fable 5 | 16/arm | 0/16 | **0/16** | - |
-| verbatim 12-char hex recall, dense render, Opus | 15 | 15/15 | **0/15** | - |
-| verbatim 12-char hex recall, dense render, Fable 5 | 15 | - | **13/15** | - |
+| 新造算术题，`claude-fable-5` | 100 | 100% | **100%** | **−38%** |
+| 新造算术题，`claude-opus-4-8` | 100 | 100% | 93% | −38% |
+| 要点回忆 A/B（决策、数值、路径、名称、否定式；含干扰项；1.5万–4.5万字符会话），Fable 5 | 98/组 | 98/98 | **98/98** | - |
+| 状态跟踪（值被改写 3 次，问最终值/初始值/次数），Fable 5 | 18/组 | 18/18 | **18/18** | - |
+| 对从未陈述过的事实的编造率（越低越好），Fable 5 | 16/组 | 0/16 | **0/16** | - |
+| 逐字回读 12 位十六进制，密集渲染页，Opus | 15 | 15/15 | **0/15** | - |
+| 逐字回读 12 位十六进制，密集渲染页，Fable 5 | 15 | - | **13/15** | - |
 
-SWE-bench run totals, receipts, and caveats:
+SWE-bench 完整数据、凭据与注意事项：
 [`eval/swe-bench/`](eval/swe-bench/) ·
 [`eval/swe-bench-pro/`](eval/swe-bench-pro/) ·
 [`eval/needle-haystack/`](eval/needle-haystack/) ·
-[`eval/gist-recall/`](eval/gist-recall/) · analysis in
-[`FINDINGS.md`](FINDINGS.md). (GSM8K scored 96% imaged, but it's in training
-data — memorized answers survive misreads — so we lead with the novel-number
-evals.)
+[`eval/gist-recall/`](eval/gist-recall/) · 分析见
+[`FINDINGS.md`](FINDINGS.md)。（GSM8K 图片化后得分 96%，但它在训练
+数据里 —— 背下来的答案抗误读 —— 所以我们以新造数字的评测为准。）
 
-## How it works
+## 工作原理
 
 ```
-tool_result string ──► wrap at 1928px-wide columns ──► pack ~92,000 chars/page ──► PNG[]
+tool_result 字符串 ──► 按 1928px 宽分栏折行 ──► 每页装填约 92,000 字符 ──► PNG[]
 ```
 
-The proxy intercepts `/v1/messages`, rewrites eligible bulk into image
-blocks, splices them back cache-friendly (static prefix preserved, prompt
-caching keeps working), and forwards. A 1928×1928 image costs ≈4,761 vision
-tokens and holds ≈92,000 chars, so text wins only above ~19 chars/token —
-Claude Code traffic runs ~1.91 (N=391). A per-request estimator decides;
-sparse prose stays text. Events log to `~/.pxpipe/events.jsonl`.
+代理拦截 `/v1/messages`，把符合条件的大块内容改写为图片块，再以
+缓存友好的方式拼回去（静态前缀保持不变，prompt caching 继续生效），
+然后转发。一张 1928×1928 的图片约花费 4761 个视觉 token、可容纳约
+92,000 字符，因此只有当文本超过约 19 字符/token 时文本才更划算 ——
+而 Claude Code 的实际流量约为 1.91（N=391）。每个请求由估算器逐一
+判断；稀疏散文保持文本。事件记录在 `~/.pxpipe/events.jsonl`。
 
-## Library use (no proxy)
+## 作为库使用（不经代理）
 
 ```ts
 import { renderTextToImages, transformAnthropicMessages } from "pxpipe-proxy";
@@ -126,92 +126,101 @@ const { body, applied, info } = await transformAnthropicMessages({
 });
 ```
 
-`options.keepSharp(block)` pins blocks as text; `options.emitRecoverable`
-returns the originals of imaged blocks. Pure-JS runtime (Node and
-edge/Workers); `@napi-rs/canvas` is build-time only. Full API:
-`src/core/index.ts`.
+`options.keepSharp(block)` 可将指定块固定为文本；`options.emitRecoverable`
+会返回被图片化块的原文。纯 JS 运行时（Node 及 edge/Workers）；
+`@napi-rs/canvas` 仅在构建期使用。完整 API 见 `src/core/index.ts`。
 
-## Development
+## 开发
 
 ```bash
 pnpm install && pnpm test
-pnpm run build                # regenerates dist/
+pnpm run build                # 重新生成 dist/
 ```
 
 ## FAQ
 
-**Is the headline end-to-end, or only on the requests you touched?**
-End-to-end, the whole bill. Most compression tools report savings only on
-the input slice they touched, which flatters the number. The end-to-end
-denominator is *every* production request: the small ones pxpipe correctly
-left untouched, all cache writes and reads, and all output tokens (which the
-proxy never compresses). On a 13,709-request snapshot that was 59% ($100 →
-~$41); a later 8,904-compressed-request trace measured ~70%. Compressed-only
-runs higher (~72–74%) and is quoted separately, never as the headline. The
-exact figure is workload-dependent — reproduce it on your own log.
+**标题里的省钱比例是端到端的，还是只算被压缩的那些请求？**
+端到端，算的是整张账单。多数压缩工具只在它们碰过的输入切片上报节省
+比例，数字会因此虚高。这里的端到端分母是*所有*生产请求：pxpipe 正确
+放行未动的小请求、全部缓存写入与读取、以及全部输出 token（代理从不
+压缩输出）。在一份 13,709 个请求的快照上是 59%（$100 → 约 $41）；
+之后一份含 8,904 个被压缩请求的记录测得约 70%。只统计被压缩请求则
+更高（约 72–74%），该口径单独标注，从不用作标题数字。确切比例取决
+于负载 —— 请在你自己的日志上复现。
 
-**How is the math measured?**
-Both sides of the same request, at the same moment. For every `/v1/messages`
-POST the proxy fires a free `count_tokens` probe on the original uncompressed
-body (the counterfactual) in parallel with the real forward, and reads
-Anthropic's actually-billed usage block off the response. Both land in the
-same row of `~/.pxpipe/events.jsonl`, so there is no turn-count or
-run-to-run confound. Dollar conversion uses Fable 5 list ratios: input ×1.0,
-cache write ×1.25, cache read ×0.1, output ×5. Cache pricing is applied
-identically to both sides, so the caching discount cancels and cannot be
-double-counted as "savings". Re-derive it yourself from the events log: the
-formula and field names are documented in `src/core/baseline.ts`.
+**省钱是怎么算出来的？**
+同一请求的两侧，在同一时刻测量。对每个 `/v1/messages` POST，代理在
+真实转发的同时，对原始未压缩请求体并行发起一次免费的 `count_tokens`
+探测（作为反事实基线），并从响应中读取 Anthropic 实际计费的 usage
+数据。两者落在 `~/.pxpipe/events.jsonl` 的同一行里，因此不存在轮数
+或运行间的混杂因素。折算美元使用 Fable 5 定价比例：输入 ×1.0、缓存
+写入 ×1.25、缓存读取 ×0.1、输出 ×5。缓存定价对两侧一视同仁，缓存
+折扣相互抵消，不可能被重复计入"节省"。你可以从事件日志自行重新推导：
+公式与字段名记录在 `src/core/baseline.ts`。
 
-**What does it actually compress?**
-Three kinds of *input* blocks, each behind a profitability gate:
+**它到底压缩什么？**
+三类*输入*块，每类都要过盈利性闸门：
 
-1. large `tool_result` bodies (file reads, command output, logs) above
-   ~6k chars of token-dense content
-2. older collapsed history: turns behind the live tail get re-rendered as
-   image pages, recent turns always stay text
-3. the static system prompt + tool docs slab
+1. 大体积 `tool_result`（文件读取、命令输出、日志），token 密集且
+   超过约 6000 字符
+2. 较早的折叠历史：活跃尾部之前的对话轮会被重新渲染为图片页，
+   最近的对话轮始终保持文本
+3. 静态的系统提示词 + 工具文档整块
 
-Everything else passes through byte-identical: your messages, recent turns,
-the model's output (it is the response, the proxy never touches it), sparse
-prose, and anything too small to win. Models outside the allowlist pass
-through entirely — the default scope is Fable 5 and GPT 5.6 only. Opus 4.8
-and GPT 5.5 read imaged content measurably worse (FINDINGS.md 2026-06-16),
-so they are deliberately opt-in via the dashboard or `PXPIPE_MODELS`, never
-silently imaged.
+其余一切逐字节直通：你的消息、最近的对话轮、模型的输出（那是响应，
+代理从不碰它）、稀疏散文、以及体积太小不划算的内容。允许列表之外的
+模型整体直通 —— 默认范围仅 Fable 5 和 GPT 5.6。Opus 4.8 和 GPT 5.5
+阅读图片化内容的能力显著更差（FINDINGS.md 2026-06-16），所以它们
+必须通过仪表盘或 `PXPIPE_MODELS` 明确开启，绝不会被悄悄图片化。
 
-**Has it ever failed for real, outside the benchmarks?**
-Yes, once in weeks of daily use: the model recalled a person's name from
-imaged chat history and got it confidently wrong. No error, just a
-plausible wrong name. That is the documented failure mode: exact strings
-in imaged content are not byte-safe. Coding sessions tolerate this because
-the agent re-reads files before editing; pure chat recall has no such check.
-This failure mode is measured, not anecdotal:
-[the legibility audit](docs/LEGIBILITY-AUDIT-2026-07-01.md) quantifies
-exact-string recall off rendered pages (blind reads top out at 63% on dense
-identifiers, with every miss predicted by a glyph-confusability matrix) and
-documents the shipped mitigations — page geometry clamped to the API's
-resample cap so billed pixels actually reach the vision encoder, and exact
-identifiers (SHAs, numbers) riding alongside as text.
+**在基准测试之外，它真实翻过车吗？**
+翻过，数周日常使用中出过一次：模型从图片化的聊天历史里回忆一个人名，
+自信地答错了。没有报错，只是一个貌似合理的错名字。这正是已记录在案
+的失效模式：图片化内容中的精确字符串不保证逐字节正确。编码类会话能
+容忍这一点，因为 agent 在编辑前会重新读文件；纯聊天式回忆则没有这层
+校验。这个失效模式是被测量过的，不是轶事：
+[可读性审计](docs/LEGIBILITY-AUDIT-2026-07-01.md)量化了从渲染页
+回读精确字符串的能力（盲读在密集标识符上最高 63%，且每次误读都能被
+字形混淆矩阵预测），并记录了已上线的缓解措施 —— 页面几何钳制到 API
+的重采样上限，确保计费像素真正到达视觉编码器；精确标识符（SHA、
+数字）以文本形式随行。
 
-**Why does the README read like an AI wrote it?**
-Because one did. Most of this repo's commits — the code and the docs — were
-authored by Opus/Fable agent sessions running behind pxpipe itself, reading
-their own collapsed history as image pages while they worked.
+**为什么这份 README 读起来像 AI 写的？**
+因为就是 AI 写的。本仓库的绝大多数提交 —— 代码和文档 —— 都出自
+运行在 pxpipe 之后的 Opus/Fable agent 会话，它们一边工作，一边以
+图片页的形式阅读自己被折叠的历史。
 
-## Limitations
+## 局限
 
-- Lossy (above); verbatim recall from images is unreliable.
-- PNG encoding adds latency to large requests before they leave.
-- ASCII/Latin-1 well tested; CJK works but conservatively.
+- 有损（见上文）；从图片逐字回读不可靠。
+- 大请求在发出前要先做 PNG 编码，会增加延迟。
+- ASCII/Latin-1 经过充分测试；CJK 可用但按保守策略处理。
 
-## Roadmap
+## 中文适配 Roadmap
 
-Hypotheses, not claims — they ship as numbers with an n or they get cut:
-sharper glyph rendering (`eval/glyph-matrix/`, paused mid-run), whether
-imaged bulk stretches effective context (~2x the real content in the same
-1M window), and whether a smaller active context improves long-task
-accuracy.
+上游对 CJK 只做保守处理（见上一节最后一条），而这恰是本 fork 存在的
+理由。以下均为**计划中的工作，尚未完成**，完成一项勾一项：
 
-## License
+- [ ] **CJK 字形渲染**：审计并扩充字形图集（`scripts/gen-atlas.ts`、
+  `src/core/atlas.ts`）对常用汉字的覆盖与渲染密度，用
+  `eval/glyph-matrix/` 的方法量化中文字形的混淆率
+- [ ] **中文 token 密度重新校准**：上游的盈利性闸门按英文流量校准
+  （约 1.91 字符/token，N=391）；中文文本约 1 字符/token 甚至更低，
+  图片化的盈亏平衡点完全不同，需要基于中文 Claude Code 真实流量重新
+  测定
+- [ ] **中文可读性评测**：复刻 needle-haystack / gist-recall /
+  逐字回读评测的中文版本，给出与英文表格同口径的数据
+- [ ] **中文文档**：README（本文件）、FINDINGS、docs/ 关键文档的
+  中文化
+- [ ] **持续跟进上游**：定期同步 teamchong/pxpipe 的修复与发布
 
-MIT.
+## 上游 Roadmap
+
+假设而非承诺 —— 要么带着样本量以数字形式落地，要么砍掉：
+更锐利的字形渲染（`eval/glyph-matrix/`，运行中途暂停）、图片化的
+大块内容能否拉伸有效上下文（同一个 1M 窗口装下约 2 倍的真实内容）、
+以及更小的活跃上下文是否能提升长任务的准确率。
+
+## 许可证
+
+MIT。
