@@ -1,0 +1,310 @@
+{
+  "generatedAt": "2026-07-05T02:59:08.631Z",
+  "mode": "usage",
+  "model": "claude-haiku-4-5",
+  "blocks": 40,
+  "fit": {
+    "a": 2.0314520749706158,
+    "b": 0.15113675313743277,
+    "intercept": 925.618588300991,
+    "r2": 0.38919
+  },
+  "cptCjk": 0.492,
+  "cptOther": 6.617,
+  "perBlock": [
+    {
+      "i": 0,
+      "len": 206,
+      "cjk": 94,
+      "other": 112,
+      "tokens": 1057
+    },
+    {
+      "i": 1,
+      "len": 227,
+      "cjk": 172,
+      "other": 55,
+      "tokens": 1107
+    },
+    {
+      "i": 2,
+      "len": 240,
+      "cjk": 115,
+      "other": 125,
+      "tokens": 1071
+    },
+    {
+      "i": 3,
+      "len": 243,
+      "cjk": 89,
+      "other": 154,
+      "tokens": 1054
+    },
+    {
+      "i": 4,
+      "len": 256,
+      "cjk": 143,
+      "other": 113,
+      "tokens": 1110
+    },
+    {
+      "i": 5,
+      "len": 306,
+      "cjk": 177,
+      "other": 129,
+      "tokens": 1139
+    },
+    {
+      "i": 6,
+      "len": 286,
+      "cjk": 77,
+      "other": 209,
+      "tokens": 1082
+    },
+    {
+      "i": 7,
+      "len": 415,
+      "cjk": 189,
+      "other": 226,
+      "tokens": 1199
+    },
+    {
+      "i": 8,
+      "len": 314,
+      "cjk": 221,
+      "other": 93,
+      "tokens": 1143
+    },
+    {
+      "i": 9,
+      "len": 431,
+      "cjk": 344,
+      "other": 87,
+      "tokens": 1310
+    },
+    {
+      "i": 10,
+      "len": 402,
+      "cjk": 159,
+      "other": 243,
+      "tokens": 1190
+    },
+    {
+      "i": 11,
+      "len": 444,
+      "cjk": 139,
+      "other": 305,
+      "tokens": 1190
+    },
+    {
+      "i": 12,
+      "len": 423,
+      "cjk": 290,
+      "other": 133,
+      "tokens": 1296
+    },
+    {
+      "i": 13,
+      "len": 506,
+      "cjk": 242,
+      "other": 264,
+      "tokens": 1281
+    },
+    {
+      "i": 14,
+      "len": 436,
+      "cjk": 170,
+      "other": 266,
+      "tokens": 1197
+    },
+    {
+      "i": 15,
+      "len": 574,
+      "cjk": 208,
+      "other": 366,
+      "tokens": 1277
+    },
+    {
+      "i": 16,
+      "len": 458,
+      "cjk": 153,
+      "other": 305,
+      "tokens": 1205
+    },
+    {
+      "i": 17,
+      "len": 694,
+      "cjk": 193,
+      "other": 501,
+      "tokens": 1305
+    },
+    {
+      "i": 18,
+      "len": 465,
+      "cjk": 161,
+      "other": 304,
+      "tokens": 1212
+    },
+    {
+      "i": 19,
+      "len": 741,
+      "cjk": 189,
+      "other": 552,
+      "tokens": 1370
+    },
+    {
+      "i": 20,
+      "len": 539,
+      "cjk": 126,
+      "other": 413,
+      "tokens": 1290
+    },
+    {
+      "i": 21,
+      "len": 934,
+      "cjk": 507,
+      "other": 427,
+      "tokens": 1649
+    },
+    {
+      "i": 22,
+      "len": 600,
+      "cjk": 370,
+      "other": 230,
+      "tokens": 1401
+    },
+    {
+      "i": 23,
+      "len": 974,
+      "cjk": 270,
+      "other": 704,
+      "tokens": 1525
+    },
+    {
+      "i": 24,
+      "len": 694,
+      "cjk": 193,
+      "other": 501,
+      "tokens": 1305
+    },
+    {
+      "i": 25,
+      "len": 1052,
+      "cjk": 350,
+      "other": 702,
+      "tokens": 1600
+    },
+    {
+      "i": 26,
+      "len": 757,
+      "cjk": 309,
+      "other": 448,
+      "tokens": 1507
+    },
+    {
+      "i": 27,
+      "len": 1087,
+      "cjk": 181,
+      "other": 906,
+      "tokens": 1564
+    },
+    {
+      "i": 28,
+      "len": 832,
+      "cjk": 465,
+      "other": 367,
+      "tokens": 6640
+    },
+    {
+      "i": 29,
+      "len": 1290,
+      "cjk": 684,
+      "other": 606,
+      "tokens": 1977
+    },
+    {
+      "i": 30,
+      "len": 974,
+      "cjk": 270,
+      "other": 704,
+      "tokens": 1525
+    },
+    {
+      "i": 31,
+      "len": 1714,
+      "cjk": 489,
+      "other": 1225,
+      "tokens": 2077
+    },
+    {
+      "i": 32,
+      "len": 1052,
+      "cjk": 350,
+      "other": 702,
+      "tokens": 1600
+    },
+    {
+      "i": 33,
+      "len": 1910,
+      "cjk": 651,
+      "other": 1259,
+      "tokens": 2341
+    },
+    {
+      "i": 34,
+      "len": 1290,
+      "cjk": 684,
+      "other": 606,
+      "tokens": 1977
+    },
+    {
+      "i": 35,
+      "len": 2211,
+      "cjk": 309,
+      "other": 1902,
+      "tokens": 2096
+    },
+    {
+      "i": 36,
+      "len": 1714,
+      "cjk": 489,
+      "other": 1225,
+      "tokens": 2078
+    },
+    {
+      "i": 37,
+      "len": 2978,
+      "cjk": 513,
+      "other": 2465,
+      "tokens": 2540
+    },
+    {
+      "i": 38,
+      "len": 1910,
+      "cjk": 651,
+      "other": 1259,
+      "tokens": 2343
+    },
+    {
+      "i": 39,
+      "len": 4000,
+      "cjk": 1633,
+      "other": 2367,
+      "tokens": 4203
+    }
+  ],
+  "robustRefit": {
+    "method": "iterative 2.5-sigma outlier rejection (2 passes, blocks 28 & 37 dropped)",
+    "rows": 38,
+    "fit": {
+      "a": 1.3071895424836601,
+      "b": 0.4892367906066536,
+      "intercept": 841.1,
+      "r2": 0.996
+    },
+    "cptCjkRelayScaled": 0.765,
+    "cptOtherRelayScaled": 2.044,
+    "note": "relay inflates billed usage (const 841 tok + ~1.96x multiplier); ratio cjk/other = 2.67x is inflation-invariant; anchored to pipeline baseCpt=4 => CPT_CJK = 4*(0.765/2.044) = 1.497 ~= 1.5 (shipped value CONFIRMED, not changed)",
+    "cptCjkAnchored": 1.497
+  }
+}

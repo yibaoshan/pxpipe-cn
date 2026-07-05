@@ -1,0 +1,276 @@
+{
+  "generatedAt": "2026-07-05T02:07:59.945Z",
+  "corpus": "eval/corpus/text-blocks-cn.json",
+  "denseCharBudgetPerPage": 28080,
+  "blocks": 20,
+  "totalChars": 13848,
+  "totalPages": 20,
+  "totalDroppedChars": 24,
+  "droppedRate": 0.00173,
+  "totalImageTokens": 1582,
+  "charsPerImageToken": 8.75,
+  "topDroppedCodepoints": [
+    {
+      "codepoint": "U+FE0F",
+      "char": "️",
+      "count": 6
+    },
+    {
+      "codepoint": "U+2B50",
+      "char": "⭐",
+      "count": 5
+    },
+    {
+      "codepoint": "U+1F4C9",
+      "char": "📉",
+      "count": 4
+    },
+    {
+      "codepoint": "U+1F195",
+      "char": "🆕",
+      "count": 2
+    },
+    {
+      "codepoint": "U+1F3AF",
+      "char": "🎯",
+      "count": 2
+    },
+    {
+      "codepoint": "U+1F4E7",
+      "char": "📧",
+      "count": 2
+    },
+    {
+      "codepoint": "U+1F680",
+      "char": "🚀",
+      "count": 2
+    },
+    {
+      "codepoint": "U+1F4B0",
+      "char": "💰",
+      "count": 1
+    }
+  ],
+  "perBlock": [
+    {
+      "block": 0,
+      "cjkFraction": 0.514,
+      "chars": 206,
+      "pages": 1,
+      "charsRendered": 206,
+      "droppedChars": 0,
+      "pixels": 24128,
+      "imageTokens": 33,
+      "charsPerImageToken": 6.24
+    },
+    {
+      "block": 1,
+      "cjkFraction": 0.553,
+      "chars": 240,
+      "pages": 1,
+      "charsRendered": 241,
+      "droppedChars": 0,
+      "pixels": 37632,
+      "imageTokens": 51,
+      "charsPerImageToken": 4.71
+    },
+    {
+      "block": 2,
+      "cjkFraction": 0.624,
+      "chars": 256,
+      "pages": 1,
+      "charsRendered": 257,
+      "droppedChars": 0,
+      "pixels": 37632,
+      "imageTokens": 51,
+      "charsPerImageToken": 5.02
+    },
+    {
+      "block": 3,
+      "cjkFraction": 0.321,
+      "chars": 286,
+      "pages": 1,
+      "charsRendered": 287,
+      "droppedChars": 0,
+      "pixels": 37632,
+      "imageTokens": 51,
+      "charsPerImageToken": 5.61
+    },
+    {
+      "block": 4,
+      "cjkFraction": 0.754,
+      "chars": 314,
+      "pages": 1,
+      "charsRendered": 315,
+      "droppedChars": 0,
+      "pixels": 37632,
+      "imageTokens": 51,
+      "charsPerImageToken": 6.16
+    },
+    {
+      "block": 5,
+      "cjkFraction": 0.48,
+      "chars": 402,
+      "pages": 1,
+      "charsRendered": 398,
+      "droppedChars": 0,
+      "pixels": 37632,
+      "imageTokens": 51,
+      "charsPerImageToken": 7.88
+    },
+    {
+      "block": 6,
+      "cjkFraction": 0.773,
+      "chars": 423,
+      "pages": 1,
+      "charsRendered": 425,
+      "droppedChars": 0,
+      "pixels": 50176,
+      "imageTokens": 67,
+      "charsPerImageToken": 6.31
+    },
+    {
+      "block": 7,
+      "cjkFraction": 0.462,
+      "chars": 436,
+      "pages": 1,
+      "charsRendered": 429,
+      "droppedChars": 0,
+      "pixels": 37632,
+      "imageTokens": 51,
+      "charsPerImageToken": 8.55
+    },
+    {
+      "block": 8,
+      "cjkFraction": 0.392,
+      "chars": 458,
+      "pages": 1,
+      "charsRendered": 455,
+      "droppedChars": 0,
+      "pixels": 37632,
+      "imageTokens": 51,
+      "charsPerImageToken": 8.98
+    },
+    {
+      "block": 9,
+      "cjkFraction": 0.412,
+      "chars": 465,
+      "pages": 1,
+      "charsRendered": 467,
+      "droppedChars": 0,
+      "pixels": 50176,
+      "imageTokens": 67,
+      "charsPerImageToken": 6.94
+    },
+    {
+      "block": 10,
+      "cjkFraction": 0.311,
+      "chars": 539,
+      "pages": 1,
+      "charsRendered": 539,
+      "droppedChars": 2,
+      "pixels": 50176,
+      "imageTokens": 67,
+      "charsPerImageToken": 8.04
+    },
+    {
+      "block": 11,
+      "cjkFraction": 0.667,
+      "chars": 600,
+      "pages": 1,
+      "charsRendered": 603,
+      "droppedChars": 0,
+      "pixels": 62720,
+      "imageTokens": 84,
+      "charsPerImageToken": 7.14
+    },
+    {
+      "block": 12,
+      "cjkFraction": 0.32,
+      "chars": 694,
+      "pages": 1,
+      "charsRendered": 696,
+      "droppedChars": 0,
+      "pixels": 50176,
+      "imageTokens": 67,
+      "charsPerImageToken": 10.36
+    },
+    {
+      "block": 13,
+      "cjkFraction": 0.469,
+      "chars": 757,
+      "pages": 1,
+      "charsRendered": 760,
+      "droppedChars": 0,
+      "pixels": 62720,
+      "imageTokens": 84,
+      "charsPerImageToken": 9.01
+    },
+    {
+      "block": 14,
+      "cjkFraction": 0.613,
+      "chars": 832,
+      "pages": 1,
+      "charsRendered": 836,
+      "droppedChars": 0,
+      "pixels": 75264,
+      "imageTokens": 101,
+      "charsPerImageToken": 8.24
+    },
+    {
+      "block": 15,
+      "cjkFraction": 0.33,
+      "chars": 974,
+      "pages": 1,
+      "charsRendered": 978,
+      "droppedChars": 0,
+      "pixels": 75264,
+      "imageTokens": 101,
+      "charsPerImageToken": 9.64
+    },
+    {
+      "block": 16,
+      "cjkFraction": 0.391,
+      "chars": 1052,
+      "pages": 1,
+      "charsRendered": 1056,
+      "droppedChars": 0,
+      "pixels": 75264,
+      "imageTokens": 101,
+      "charsPerImageToken": 10.42
+    },
+    {
+      "block": 17,
+      "cjkFraction": 0.603,
+      "chars": 1290,
+      "pages": 1,
+      "charsRendered": 1294,
+      "droppedChars": 3,
+      "pixels": 100352,
+      "imageTokens": 134,
+      "charsPerImageToken": 9.63
+    },
+    {
+      "block": 18,
+      "cjkFraction": 0.319,
+      "chars": 1714,
+      "pages": 1,
+      "charsRendered": 1720,
+      "droppedChars": 7,
+      "pixels": 112896,
+      "imageTokens": 151,
+      "charsPerImageToken": 11.35
+    },
+    {
+      "block": 19,
+      "cjkFraction": 0.402,
+      "chars": 1910,
+      "pages": 1,
+      "charsRendered": 1910,
+      "droppedChars": 12,
+      "pixels": 125440,
+      "imageTokens": 168,
+      "charsPerImageToken": 11.37
+    }
+  ]
+}

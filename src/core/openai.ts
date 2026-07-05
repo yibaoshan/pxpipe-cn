@@ -38,6 +38,7 @@ import {
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
 import { factSheetText } from './factsheet.js';
 import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
+import { blendedCpt } from './cpt.js';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
 // cost model, max image height) live in ./gpt-model-profiles.ts so a new model is a
@@ -474,7 +475,9 @@ function evalOpenAIGate(
   const estImages = estimateImageCount(renderedText, cols, 1);
   const perStrip = openAIVisionTokens(model, stripW, resolveGptProfile(model).maxHeightPx);
   const imageTokens = estImages * perStrip;
-  const textTokens = renderedText.length / charsPerToken;
+  // blendedCpt: CJK runs ~1.5 chars/token, not the English-tuned constant.
+  // Pure-English text divides by charsPerToken exactly (cjk=0 ⇒ identity).
+  const textTokens = renderedText.length / blendedCpt(renderedText, charsPerToken);
   return { imageTokens, textTokens, profitable: imageTokens < textTokens };
 }
 

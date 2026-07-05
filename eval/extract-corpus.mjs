@@ -38,6 +38,8 @@ const { values: args } = parseArgs({
     'max-sessions': { type: 'string',  default: '10'  },
     'out-dir':      { type: 'string',  default: 'eval/corpus' },
     'projects-dir': { type: 'string',  default: join(homedir(), '.claude', 'projects') },
+    'cjk':          { type: 'boolean', default: false },
+    'cjk-min':      { type: 'string',  default: '0.3' },
     'verbose':      { type: 'boolean', default: false },
     'help':         { type: 'boolean', default: false },
   },
@@ -53,6 +55,8 @@ Options:
   --max-sessions N    Max sessions to extract for L2 (default: 10)
   --out-dir DIR       Output directory (default: eval/corpus)
   --projects-dir DIR  Claude projects dir (default: ~/.claude/projects)
+  --cjk               Keep only CJK-heavy blocks/sessions; writes *-cn.json
+  --cjk-min F         Min CJK codepoint fraction for --cjk (default: 0.3)
   --verbose           Print verbose progress
   --help              Show this help
 `);
@@ -63,6 +67,8 @@ const MAX_BLOCKS   = parseInt(args['max-blocks'],   10);
 const MAX_SESSIONS = parseInt(args['max-sessions'], 10);
 const OUT_DIR      = resolve(args['out-dir']);
 const PROJECTS_DIR = args['projects-dir'];
+const CJK_ONLY     = args['cjk'];
+const CJK_MIN      = parseFloat(args['cjk-min']);
 const VERBOSE      = args['verbose'];
 
 /** How many files to scan before giving up (avoid scanning 13k+ files). */
@@ -167,7 +173,27 @@ function isGoodBlock(text) {
   if (!text || text.trim().length < 200) return false;
   if (/^warmup$/i.test(text.trim())) return false;
   if (text.trim().split('\n').length < 3) return false;
+  if (CJK_ONLY && cjkFraction(text) < CJK_MIN) return false;
   return true;
+}
+
+/** Fraction of codepoints in CJK ranges (hanzi, Ext-A, CJK punct, kana, fullwidth forms). */
+function cjkFraction(text) {
+  if (!text) return 0;
+  let cjk = 0;
+  let total = 0;
+  for (const ch of text) {
+    const cc = ch.codePointAt(0);
+    if (cc <= 0x20) continue; // skip whitespace/control — don't dilute the ratio
+    total++;
+    if (
+      (cc >= 0x4e00 && cc <= 0x9fff) || // CJK Unified Ideographs
+      (cc >= 0x3400 && cc <= 0x4dbf) || // Ext-A
+      (cc >= 0x3000 && cc <= 0x30ff) || // CJK punct + kana
+      (cc >= 0xff00 && cc <= 0xffef)    // fullwidth forms
+    ) cjk++;
+  }
+  return total === 0 ? 0 : cjk / total;
 }
 
 // ---------------------------------------------------------------------------
@@ -210,10 +236,11 @@ for (const filePath of walkJsonl(PROJECTS_DIR, MAX_FILES_SCANNED)) {
       if (seenTexts.has(key)) continue;
       seenTexts.add(key);
       l1Blocks.push({
-        sessionId: turn.sessionId ?? 'unknown',
-        role:      turn.message.role,
-        charCount: text.length,
-        text:      text.slice(0, 4000),
+        sessionId:   turn.sessionId ?? 'unknown',
+        role:        turn.message.role,
+        charCount:   text.length,
+        cjkFraction: Number(cjkFraction(text).toFixed(3)),
+        text:        text.slice(0, 4000),
       });
     }
   }
@@ -237,11 +264,13 @@ for (const filePath of walkJsonl(PROJECTS_DIR, MAX_FILES_SCANNED)) {
     const questionTurn = usable[usable.length - 2];
     const expectedTurn = usable[usable.length - 1];
     if (!questionTurn || !expectedTurn) continue;
+    if (CJK_ONLY && cjkFraction(historyText) < CJK_MIN) continue;
 
     l2Sessions.push({
       sessionId:        turns[0]?.sessionId ?? filePath,
       totalTurns:       usable.length,
       historyCharCount: historyText.length,
+      cjkFraction:      Number(cjkFraction(historyText).toFixed(3)),
       historyText:      historyText.slice(0, 8000),
       questionText:     extractText(questionTurn.message.content).slice(0, 2000),
       expectedAnswer:   extractText(expectedTurn.message.content).slice(0, 2000),
@@ -272,12 +301,17 @@ for (const b of l1Blocks) {
 l2Sessions.sort((a, b) => b.historyCharCount - a.historyCharCount);
 const finalSessions = l2Sessions.slice(0, TARGET_SESSIONS);
 
-// Fallback to synthetic if still empty
+// Fallback to synthetic if still empty (English-only; under --cjk just warn —
+// a synthetic English corpus would silently invalidate a CJK run)
 if (finalBlocks.length === 0) {
-  log('WARNING: no text blocks found — using synthetic fallback corpus');
-  finalBlocks.push(...syntheticBlocks());
+  if (CJK_ONLY) {
+    log(`WARNING: no CJK blocks (fraction ≥ ${CJK_MIN}) found — nothing to write`);
+  } else {
+    log('WARNING: no text blocks found — using synthetic fallback corpus');
+    finalBlocks.push(...syntheticBlocks());
+  }
 }
-if (finalSessions.length === 0) {
+if (finalSessions.length === 0 && !CJK_ONLY) {
   log('WARNING: no sessions found — using synthetic fallback sessions');
   finalSessions.push(...syntheticSessions());
 }
@@ -291,8 +325,8 @@ log(`Selected ${finalSessions.length}/${TARGET_SESSIONS} sessions for L2`);
 
 mkdirSync(OUT_DIR, { recursive: true });
 
-const blocksPath   = join(OUT_DIR, 'text-blocks.json');
-const sessionsPath = join(OUT_DIR, 'sessions.json');
+const blocksPath   = join(OUT_DIR, CJK_ONLY ? 'text-blocks-cn.json' : 'text-blocks.json');
+const sessionsPath = join(OUT_DIR, CJK_ONLY ? 'sessions-cn.json'    : 'sessions.json');
 
 writeFileSync(blocksPath,   JSON.stringify(finalBlocks,   null, 2), 'utf8');
 writeFileSync(sessionsPath, JSON.stringify(finalSessions, null, 2), 'utf8');

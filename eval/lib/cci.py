@@ -188,6 +188,10 @@ def main():
         r"|^\s*[✻✶✳✽✢⋆∗·*]\s+\S+…",  # animated spinner glyph + verb + ellipsis
         re.I | re.M)
     trust_re = re.compile(r"trust this folder|Quick safety check|created or one you trust", re.I)
+    # First-run --dangerously-skip-permissions acceptance dialog ("WARNING: Claude
+    # Code running in Bypass Permissions mode … 2. Yes, I accept"). Distinct from
+    # the lowercase "bypass permissions" footer indicator that ready_re matches.
+    bypass_gate_re = re.compile(r"Yes, I accept", re.I)
     ready_re = re.compile(r"Welcome back|Try \"|bypass permissions")
 
     # 1) wait for ready; accept trust gate by pressing 1 + Enter
@@ -200,6 +204,12 @@ def main():
         s = scr()
         if trust_re.search(s):
             child.send("1\r"); time.sleep(0.8); continue
+        if bypass_gate_re.search(s):
+            child.send("2\r"); time.sleep(0.8)
+            # Redraw won't repaint cells the dialog left behind; blank the dialog
+            # lines in pyte's buffer so ready detection sees only fresh output.
+            child.send("\x0c")  # Ctrl-L: ask the TUI for a full repaint
+            time.sleep(0.5); continue
         if ready_re.search(s) and not working_re.search(s):
             ready = True; break
     if not ready:

@@ -61,6 +61,12 @@ export interface TrackEvent {
   dropped_chars?: number;
   /** Top-20 dropped codepoints (U+HHHH keys) by frequency. Only present when dropped_chars > 0. */
   dropped_codepoints_top?: Record<string, number>;
+  /** Fraction of non-whitespace codepoints in CJK ranges across the ORIGINAL request text.
+   *  Only present when > 0. Pairs with baseline_tokens for CPT_CJK recalibration. */
+  cjk_fraction?: number;
+  /** Blended chars-per-token the profitability gates used for this request
+   *  (base charsPerToken folded with CPT_CJK). Only present alongside cjk_fraction. */
+  cpt_used?: number;
   /** Blocks that weren't image-compressed this request; only emitted when at least one counter > 0. */
   passthrough_reasons?: { below_threshold?: number; not_profitable?: number };
   /** Unrecognized tag names in the static slab — canary for Claude Code releases adding new dynamic tags. */
@@ -239,6 +245,10 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.droppedCodepointsTop && Object.keys(info.droppedCodepointsTop).length > 0) {
       out.dropped_codepoints_top = info.droppedCodepointsTop;
+    }
+    if (info.cjkFraction !== undefined && info.cjkFraction > 0) {
+      out.cjk_fraction = info.cjkFraction;
+      if (info.cptUsed !== undefined) out.cpt_used = info.cptUsed;
     }
     if (info.passthroughReasons) {
       const pr = info.passthroughReasons;

@@ -148,6 +148,27 @@ const VARIANTS = [
     system: BASELINE_SYSTEM,
     prompt: BASELINE_PROMPT,
   },
+  // CN probe: same 5×8 atlas, but rendered at half cols and upscaled 2×
+  // nearest-neighbor (each glyph pixel → 2×2). Tests whether 8px-hanzi OCR
+  // errors come from the VLM encoder's resolving limit rather than the glyph
+  // bitmaps themselves. cols=150 keeps 2× width under the API's 1568px edge cap.
+  {
+    name:   'baseline-2x',
+    render: async (src) => {
+      const imgs = await renderTextToPngs(src, 150);
+      const { createCanvas, loadImage } = await import('@napi-rs/canvas');
+      return Promise.all(imgs.map(async (img) => {
+        const im = await loadImage(Buffer.from(img.png));
+        const c = createCanvas(im.width * 2, im.height * 2);
+        const ctx = c.getContext('2d');
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(im, 0, 0, im.width * 2, im.height * 2);
+        return { ...img, png: c.toBuffer('image/png'), width: im.width * 2, height: im.height * 2 };
+      }));
+    },
+    system: BASELINE_SYSTEM,
+    prompt: BASELINE_PROMPT,
+  },
   {
     name:   'reflow',
     render: (src) => renderTextToPngsReflow(src),
@@ -312,7 +333,10 @@ async function runVariant(variant, source, reference) {
     resp = await client.messages({
       system:     variant.system,
       messages:   [{ role: 'user', content }],
-      max_tokens: 2048,
+      // CN transcriptions run ~1 token/char (vs ~1/4 for EN) and the relay
+      // force-enables thinking, which shares this budget — 2048 silently
+      // truncated CJK blocks >~1.5k chars. Scale with the source, floor 2048.
+      max_tokens: Math.min(8192, Math.max(2048, 1024 + Math.ceil(reference.length * 1.5))),
     });
   } catch (err) {
     console.error(`  ERROR calling API [${variant.name}]: ${err.message}`);

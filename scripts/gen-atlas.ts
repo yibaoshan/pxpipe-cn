@@ -1,20 +1,17 @@
 /**
  * Build-time glyph atlas generator — Unicode-capable hybrid code-font atlas.
  *
- * Default atlas (2026-05): Spleen 5×8 for printable ASCII/code glyphs,
- * Unifont 16.0.04 at 8px for Unicode fallback (CJK, arrows, symbols,
- * math, Hangul, etc.). The runtime renderer still sees one sparse atlas:
- * codepoint → bit offset + wide flag. There is no runtime font dependency.
- *
- * Why hybrid instead of replacing Unifont outright:
- * - Spleen 5×8 is a real bitmap/code font and is materially denser than
- *   historical Unifont 10px atlas: 5×8 cells vs 5×11, ~38% more rows
- *   per 1932px-tall image.
- * - Spleen intentionally targets small code/terminal glyphs, but does not
- *   cover CJK/symbol blocks. Unifont remains the broad fallback so existing
- *   dropped-glyph behavior does not regress for non-ASCII text.
- * - The generator bakes both into one 1-bit atlas, preserving the Workers-safe
- *   zero-runtime-dependency contract.
+ * pxpipe-cn atlas (2026-07): three font tiers baked into one sparse atlas.
+ * - Spleen 5×8 for printable ASCII/code glyphs (unchanged from upstream).
+ * - Fusion Pixel 8px monospaced (zh_hans) for CJK ranges: purpose-designed
+ *   Chinese strokes at 8px, materially more legible than Unifont's generic
+ *   glyphs at the same cell size. Coverage is read from the font's cmap
+ *   table (skia would silently substitute system fonts for missing glyphs,
+ *   so we never draw a codepoint the font does not actually map).
+ * - Unifont 16.0.04 at 8px as the broad fallback (everything else, plus any
+ *   CJK codepoint Fusion Pixel lacks — coverage can only grow, not regress).
+ * The runtime renderer still sees one sparse atlas: codepoint → bit offset +
+ * wide flag. There is no runtime font dependency.
  *
  * Profiles (selected via ATLAS_PROFILE env, default 'full-bmp'):
  * - 'full-bmp'  (~35k codepoints): practical Unicode blocks + Hangul.
@@ -27,6 +24,7 @@ import { resolve } from 'node:path';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const PRIMARY_FONT_PATH = resolve(ROOT, 'assets/Spleen-5x8.otb');
+const CJK_FONT_PATH = resolve(ROOT, 'assets/FusionPixel-8px-monospaced-zh_hans.otf');
 const FALLBACK_FONT_PATH = resolve(ROOT, 'assets/Unifont-16.0.04.otf');
 const OUT_PATH = resolve(ROOT, 'src/core/atlas.ts');
 
@@ -36,11 +34,20 @@ const GRAY_MODE = process.env['ATLAS_GRAY'] === '1';
 const OUT_PATH_GRAY = resolve(ROOT, 'src/core/atlas-gray.ts');
 
 const PRIMARY_FONT_FAMILY = 'Spleen';
+const CJK_FONT_FAMILY = 'Fusion Pixel 8px monospaced zh_hans';
 const FALLBACK_FONT_FAMILY = 'Unifont';
 const PRIMARY_FONT_PX = 8;
+const CJK_FONT_PX = 8;
 const FALLBACK_FONT_PX = 8;
-const FONT_FAMILY_LABEL = 'Spleen 5x8 ASCII + Unifont 8px fallback';
+const FONT_FAMILY_LABEL = 'Spleen 5x8 ASCII + FusionPixel 8px CJK + Unifont 8px fallback';
 const PROFILE = (process.env.ATLAS_PROFILE ?? 'full-bmp') as 'practical' | 'full-bmp';
+
+/** Ranges routed to the CJK font when its cmap actually covers the codepoint. */
+const CJK_FONT_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x3000, 0x30ff], // CJK Symbols and Punctuation + Hiragana + Katakana
+  [0x4e00, 0x9fff], // CJK Unified Ideographs
+  [0xff00, 0xffef], // Halfwidth and Fullwidth Forms
+];
 
 /** Codepoint blocks included in each profile. */
 const PRACTICAL_RANGES: ReadonlyArray<readonly [number, number, string]> = [
@@ -74,8 +81,101 @@ const HANGUL: ReadonlyArray<readonly [number, number, string]> = [
 
 const RANGES = PROFILE === 'full-bmp' ? [...PRACTICAL_RANGES, ...HANGUL] : PRACTICAL_RANGES;
 
+// --- cmap coverage parsing --------------------------------------------------
+// skia (via @napi-rs/canvas) silently falls back to OTHER fonts when the
+// requested family lacks a glyph, so "draw it and see" cannot detect missing
+// coverage. Instead we read the font's cmap table directly and only route a
+// codepoint to the CJK font when the font really maps it to a non-.notdef
+// glyph. Supports subtable formats 4 and 12 (covers all practical fonts).
+
+function parseCmapCoverage(fontPath: string): Set<number> {
+  const buf = readFileSync(fontPath);
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const numTables = dv.getUint16(4);
+  let cmapOffset = -1;
+  for (let i = 0; i < numTables; i++) {
+    const rec = 12 + i * 16;
+    const tag = String.fromCharCode(
+      dv.getUint8(rec), dv.getUint8(rec + 1), dv.getUint8(rec + 2), dv.getUint8(rec + 3),
+    );
+    if (tag === 'cmap') {
+      cmapOffset = dv.getUint32(rec + 8);
+      break;
+    }
+  }
+  if (cmapOffset < 0) throw new Error(`[gen-atlas] no cmap table in ${fontPath}`);
+
+  // Pick the best unicode subtable: (3,10) or (0,4+) format 12 first, then (3,1)/(0,*) format 4.
+  const nSub = dv.getUint16(cmapOffset + 2);
+  let best = -1;
+  let bestScore = -1;
+  for (let i = 0; i < nSub; i++) {
+    const rec = cmapOffset + 4 + i * 8;
+    const platform = dv.getUint16(rec);
+    const encoding = dv.getUint16(rec + 2);
+    const offset = dv.getUint32(rec + 4);
+    const format = dv.getUint16(cmapOffset + offset);
+    let score = -1;
+    if (format === 12 && (platform === 3 && encoding === 10 || platform === 0)) score = 2;
+    else if (format === 4 && (platform === 3 && encoding === 1 || platform === 0)) score = 1;
+    if (score > bestScore) {
+      bestScore = score;
+      best = cmapOffset + offset;
+    }
+  }
+  if (best < 0 || bestScore < 0) throw new Error(`[gen-atlas] no usable cmap subtable in ${fontPath}`);
+
+  const coverage = new Set<number>();
+  const format = dv.getUint16(best);
+  if (format === 12) {
+    const nGroups = dv.getUint32(best + 12);
+    for (let g = 0; g < nGroups; g++) {
+      const rec = best + 16 + g * 12;
+      const start = dv.getUint32(rec);
+      const end = dv.getUint32(rec + 4);
+      const startGlyph = dv.getUint32(rec + 8);
+      for (let cp = start; cp <= end; cp++) {
+        if (startGlyph + (cp - start) !== 0) coverage.add(cp);
+      }
+    }
+  } else if (format === 4) {
+    const segCount = dv.getUint16(best + 6) / 2;
+    const endBase = best + 14;
+    const startBase = endBase + segCount * 2 + 2; // +2 skips reservedPad
+    const deltaBase = startBase + segCount * 2;
+    const rangeBase = deltaBase + segCount * 2;
+    for (let s = 0; s < segCount; s++) {
+      const end = dv.getUint16(endBase + s * 2);
+      const start = dv.getUint16(startBase + s * 2);
+      const delta = dv.getInt16(deltaBase + s * 2);
+      const rangeOffset = dv.getUint16(rangeBase + s * 2);
+      if (start === 0xffff) continue;
+      for (let cp = start; cp <= end; cp++) {
+        let glyph = 0;
+        if (rangeOffset === 0) {
+          glyph = (cp + delta) & 0xffff;
+        } else {
+          const glyphAddr = rangeBase + s * 2 + rangeOffset + (cp - start) * 2;
+          if (glyphAddr + 1 < dv.byteLength) {
+            glyph = dv.getUint16(glyphAddr);
+            if (glyph !== 0) glyph = (glyph + delta) & 0xffff;
+          }
+        }
+        if (glyph !== 0) coverage.add(cp);
+      }
+    }
+  } else {
+    throw new Error(`[gen-atlas] unsupported cmap subtable format ${format} in ${fontPath}`);
+  }
+  return coverage;
+}
+
+const cjkCoverage = parseCmapCoverage(CJK_FONT_PATH);
+console.log(`[gen-atlas] CJK font cmap coverage: ${cjkCoverage.size} codepoints`);
+
 // --- Register fonts --------------------------------------------------------
 GlobalFonts.register(readFileSync(PRIMARY_FONT_PATH), PRIMARY_FONT_FAMILY);
+GlobalFonts.register(readFileSync(CJK_FONT_PATH), CJK_FONT_FAMILY);
 GlobalFonts.register(readFileSync(FALLBACK_FONT_PATH), FALLBACK_FONT_FAMILY);
 
 // Spleen 5x8 defines the global Latin cell. Unifont fallback at 8px is
@@ -97,7 +197,18 @@ for (const ch of ['M', 'g', 'p', 'y', 'j', '0', 'O', 'l', 'I', '{', '}', '[', ']
     maxDescent = m.actualBoundingBoxDescent;
   }
 }
-// Also verify fallback fits in the same height budget at its own baseline.
+// Also verify the CJK font and the fallback fit in the same height budget at
+// their own baselines.
+pctx.font = `${CJK_FONT_PX}px ${CJK_FONT_FAMILY}`;
+for (const ch of ['M', 'g', '中', '漢', '國', '测', '试', '警', '龘', '，', '。', '日', 'カ']) {
+  const m = pctx.measureText(ch);
+  if (Number.isFinite(m.actualBoundingBoxAscent) && m.actualBoundingBoxAscent > maxAscent) {
+    maxAscent = m.actualBoundingBoxAscent;
+  }
+  if (Number.isFinite(m.actualBoundingBoxDescent) && m.actualBoundingBoxDescent > maxDescent) {
+    maxDescent = m.actualBoundingBoxDescent;
+  }
+}
 pctx.font = `${FALLBACK_FONT_PX}px ${FALLBACK_FONT_FAMILY}`;
 for (const ch of ['M', 'g', 'p', 'y', 'j', '中', '漢', '國', '⌊', '∫', '日', 'カ', '한']) {
   const m = pctx.measureText(ch);
@@ -131,6 +242,14 @@ if (!Number.isFinite(fallbackLatinW) || fallbackLatinW <= 0) {
   throw new Error('[gen-atlas] could not measure fallback Unifont Latin width');
 }
 
+// Same probe for the CJK font (Fusion Pixel monospaced: half-width 4px,
+// full-width 8px at 8px em — so hanzi measure exactly 2× its own Latin).
+pctx.font = `${CJK_FONT_PX}px ${CJK_FONT_FAMILY}`;
+const cjkLatinW = pctx.measureText('M').width;
+if (!Number.isFinite(cjkLatinW) || cjkLatinW <= 0) {
+  throw new Error('[gen-atlas] could not measure CJK font Latin width');
+}
+
 console.log(
   `[gen-atlas] font=${FONT_FAMILY_LABEL} profile=${PROFILE} ` +
     `cell=${cellW}×${cellH} (asc=${ascent} desc=${descent}, wide=${2 * cellW}×${cellH})`,
@@ -139,43 +258,77 @@ console.log(
 interface Found {
   cp: number;
   wide: boolean;
-  source: 'primary' | 'fallback';
+  source: 'primary' | 'cjk' | 'fallback';
 }
 
-function sourceForCodepoint(cp: number): 'primary' | 'fallback' {
+function inCjkFontRanges(cp: number): boolean {
+  for (const [lo, hi] of CJK_FONT_RANGES) {
+    if (cp >= lo && cp <= hi) return true;
+  }
+  return false;
+}
+
+function sourceForCodepoint(cp: number): 'primary' | 'cjk' | 'fallback' {
   // Code-font-first means the exact ASCII/code glyphs that dominate Claude
-  // Code prompts use Spleen. Unicode punctuation/symbols/CJK keep Unifont.
+  // Code prompts use Spleen. CJK blocks use Fusion Pixel when its cmap really
+  // covers the codepoint; everything else keeps Unifont.
   if (cp >= 0x20 && cp <= 0x7e) return 'primary';
+  if (inCjkFontRanges(cp) && cjkCoverage.has(cp)) return 'cjk';
   return 'fallback';
 }
 
-function classifyFallbackWidth(cp: number): boolean | null {
+/** Width classification against a font's own Latin advance. `strict` throws on
+ *  odd ratios (fallback font — a drifted Unifont would corrupt the whole
+ *  atlas); non-strict returns null so the caller can fall through to Unifont. */
+function classifyWidth(
+  font: string,
+  latinW: number,
+  cp: number,
+  strict: boolean,
+): boolean | null {
+  pctx.font = font;
   const ch = String.fromCodePoint(cp);
   const w = pctx.measureText(ch).width;
   if (!Number.isFinite(w) || w <= 0) return null;
-  const ratio = w / fallbackLatinW;
+  const ratio = w / latinW;
   if (Math.abs(ratio - 1) < 0.05) return false;
   if (Math.abs(ratio - 2) < 0.05) return true;
+  if (!strict) return null;
   throw new Error(
     `[gen-atlas] fallback codepoint U+${cp.toString(16).toUpperCase()} has advance ` +
-      `${w}px (Unifont Latin=${fallbackLatinW}px, ratio=${ratio.toFixed(3)}; expected 1× or 2×).`,
+      `${w}px (Unifont Latin=${latinW}px, ratio=${ratio.toFixed(3)}; expected 1× or 2×).`,
   );
 }
+
+const CJK_FONT_STR = `${CJK_FONT_PX}px ${CJK_FONT_FAMILY}`;
+const FALLBACK_FONT_STR = `${FALLBACK_FONT_PX}px ${FALLBACK_FONT_FAMILY}`;
 
 const found: Found[] = [];
 for (const [lo, hi, label] of RANGES) {
   let kept = 0;
   let primary = 0;
+  let cjk = 0;
   let fallback = 0;
   for (let cp = lo; cp <= hi; cp++) {
-    const source = sourceForCodepoint(cp);
+    let source = sourceForCodepoint(cp);
     if (source === 'primary') {
       found.push({ cp, wide: false, source });
       primary++;
       kept++;
       continue;
     }
-    const wide = classifyFallbackWidth(cp);
+    if (source === 'cjk') {
+      // Odd advance (neither 1× nor 2×) → let Unifont take it instead.
+      const wide = classifyWidth(CJK_FONT_STR, cjkLatinW, cp, false);
+      if (wide != null) {
+        found.push({ cp, wide, source });
+        cjk++;
+        kept++;
+        continue;
+      }
+      source = 'fallback';
+    }
+    const wide = classifyWidth(FALLBACK_FONT_STR, fallbackLatinW, cp, true);
     if (wide == null) continue;
     found.push({ cp, wide, source });
     fallback++;
@@ -185,14 +338,18 @@ for (const [lo, hi, label] of RANGES) {
     `[gen-atlas]   ${label.padEnd(48)} ` +
       `U+${lo.toString(16).padStart(4, '0').toUpperCase()}..` +
       `U+${hi.toString(16).padStart(4, '0').toUpperCase()}  ` +
-      `kept ${kept}/${hi - lo + 1} (spleen=${primary}, unifont=${fallback})`,
+      `kept ${kept}/${hi - lo + 1} (spleen=${primary}, fusion=${cjk}, unifont=${fallback})`,
   );
 }
 
 found.sort((a, b) => a.cp - b.cp);
 const wideCount = found.filter((f) => f.wide).length;
 const primaryCount = found.filter((f) => f.source === 'primary').length;
-console.log(`[gen-atlas] total glyphs: ${found.length} (${wideCount} wide, ${primaryCount} Spleen primary)`);
+const cjkCount = found.filter((f) => f.source === 'cjk').length;
+console.log(
+  `[gen-atlas] total glyphs: ${found.length} ` +
+    `(${wideCount} wide, ${primaryCount} Spleen primary, ${cjkCount} Fusion Pixel CJK)`,
+);
 
 // --- Rasterize glyphs ------------------------------------------------------
 const contexts = {
@@ -201,13 +358,18 @@ const contexts = {
     wide: createCanvas(2 * cellW, cellH).getContext('2d'),
     font: `${PRIMARY_FONT_PX}px ${PRIMARY_FONT_FAMILY}`,
   },
+  cjk: {
+    narrow: createCanvas(cellW, cellH).getContext('2d'),
+    wide: createCanvas(2 * cellW, cellH).getContext('2d'),
+    font: `${CJK_FONT_PX}px ${CJK_FONT_FAMILY}`,
+  },
   fallback: {
     narrow: createCanvas(cellW, cellH).getContext('2d'),
     wide: createCanvas(2 * cellW, cellH).getContext('2d'),
     font: `${FALLBACK_FONT_PX}px ${FALLBACK_FONT_FAMILY}`,
   },
 } as const;
-for (const src of [contexts.primary, contexts.fallback]) {
+for (const src of [contexts.primary, contexts.cjk, contexts.fallback]) {
   for (const ctx of [src.narrow, src.wide]) {
     ctx.font = src.font;
     ctx.textBaseline = 'alphabetic';
@@ -290,8 +452,8 @@ if (GRAY_MODE) {
   const grayBanner = `// AUTO-GENERATED by scripts/gen-atlas.ts (ATLAS_GRAY=1) — DO NOT EDIT.
 // Regenerate with: ATLAS_GRAY=1 npx tsx scripts/gen-atlas.ts
 // EVAL-ONLY artifact: this file is NOT imported by the production render path.
-// Source fonts: assets/Spleen-5x8.otb @ ${PRIMARY_FONT_PX}px for ASCII/code; assets/Unifont-16.0.04.otf @ ${FALLBACK_FONT_PX}px fallback (profile: ${PROFILE})
-// Glyphs: ${found.length} codepoints (${wideCount} wide, ${primaryCount} Spleen primary)
+// Source fonts: assets/Spleen-5x8.otb @ ${PRIMARY_FONT_PX}px for ASCII/code; assets/FusionPixel-8px-monospaced-zh_hans.otf @ ${CJK_FONT_PX}px CJK; assets/Unifont-16.0.04.otf @ ${FALLBACK_FONT_PX}px fallback (profile: ${PROFILE})
+// Glyphs: ${found.length} codepoints (${wideCount} wide, ${primaryCount} Spleen primary, ${cjkCount} Fusion Pixel CJK)
 // Pixel format: 1 coverage byte per pixel (0-255), raw R-channel from anti-aliased canvas.
 // ATLAS_GRAY_OFFSETS are BYTE offsets (not bit offsets like ATLAS_OFFSETS).
 `;
@@ -409,8 +571,8 @@ const banner = `// AUTO-GENERATED by scripts/gen-atlas.ts — DO NOT EDIT.
 // Regenerate with: pnpm run build:atlas
 //   (or ATLAS_PROFILE=practical pnpm run build:atlas to drop Hangul for
 //    Workers free-tier deployments under the 1 MB compressed-bundle cap)
-// Source fonts: assets/Spleen-5x8.otb @ ${PRIMARY_FONT_PX}px for ASCII/code; assets/Unifont-16.0.04.otf @ ${FALLBACK_FONT_PX}px fallback (profile: ${PROFILE})
-// Glyphs: ${found.length} codepoints (${wideCount} wide, ${primaryCount} Spleen primary)
+// Source fonts: assets/Spleen-5x8.otb @ ${PRIMARY_FONT_PX}px for ASCII/code; assets/FusionPixel-8px-monospaced-zh_hans.otf @ ${CJK_FONT_PX}px CJK; assets/Unifont-16.0.04.otf @ ${FALLBACK_FONT_PX}px fallback (profile: ${PROFILE})
+// Glyphs: ${found.length} codepoints (${wideCount} wide, ${primaryCount} Spleen primary, ${cjkCount} Fusion Pixel CJK)
 `;
 
 const body = `

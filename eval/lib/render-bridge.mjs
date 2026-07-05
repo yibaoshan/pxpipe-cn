@@ -21,14 +21,19 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..', '..');
 
-const RENDER_PATH = resolve(ROOT, 'dist', 'core', 'render.js');
-const PNG_PATH    = resolve(ROOT, 'dist', 'core', 'png.js');
+// PXPIPE_EVAL_DIST: point the harness at an alternate compiled build
+// (e.g. dist-unifont vs dist-fusion for atlas A/B runs). Default: dist/.
+const DIST_DIR = process.env.PXPIPE_EVAL_DIST
+  ? resolve(ROOT, process.env.PXPIPE_EVAL_DIST)
+  : resolve(ROOT, 'dist');
+
+const RENDER_PATH = resolve(DIST_DIR, 'core', 'render.js');
+const PNG_PATH    = resolve(DIST_DIR, 'core', 'png.js');
 
 if (!existsSync(RENDER_PATH)) {
   throw new Error(
-    `[render-bridge] dist/core/render.js not found.\n` +
-    `Run \`pnpm run build\` from the repo root first.\n` +
-    `Expected: ${RENDER_PATH}`,
+    `[render-bridge] ${RENDER_PATH} not found.\n` +
+    `Run \`pnpm run build\` from the repo root first (or fix PXPIPE_EVAL_DIST).`,
   );
 }
 

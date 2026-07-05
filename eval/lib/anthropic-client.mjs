@@ -44,6 +44,65 @@ const CLAUDE_BIN = join(homedir(), '.claude', 'local', 'claude');
 const CCI_PY = join(dirname(fileURLToPath(import.meta.url)), 'cci.py');
 const PYTHON = process.env.CCI_PYTHON || 'python3';
 
+// ---------------------------------------------------------------------------
+// Direct-HTTP mode (relay auth)
+//
+// The CLI path above assumes Max-subscription OAuth and that ANTHROPIC_BASE_URL
+// points at the LOCAL pxpipe proxy (so it must be stripped). Neither holds when
+// the operator authenticates through a remote relay: there is no OAuth in the
+// keychain, and ANTHROPIC_AUTH_TOKEN is only valid AGAINST the relay — sending
+// it to api.anthropic.com yields 401 "Invalid bearer token". In that setup the
+// relay speaks the plain Messages API (verified incl. image blocks), so we call
+// it directly and skip the TUI entirely. Auto-detected: a non-local
+// ANTHROPIC_BASE_URL plus a token selects HTTP mode; force with
+// PXPIPE_EVAL_TRANSPORT=http|cli.
+// ---------------------------------------------------------------------------
+
+const RELAY_BASE = (process.env.ANTHROPIC_BASE_URL ?? '').replace(/\/+$/, '');
+const RELAY_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN ?? process.env.ANTHROPIC_API_KEY ?? '';
+const RELAY_IS_LOCAL = /^https?:\/\/(localhost|127\.|0\.0\.0\.0|\[::1\])/.test(RELAY_BASE);
+const TRANSPORT = process.env.PXPIPE_EVAL_TRANSPORT
+  ?? (RELAY_BASE && RELAY_TOKEN && !RELAY_IS_LOCAL ? 'http' : 'cli');
+
+/** Resolve a harness model string to the relay's real model name (the relay
+ *  publishes its names via the ANTHROPIC_DEFAULT_*_MODEL env contract). */
+function relayModelName(model) {
+  const m = (model ?? '').toLowerCase();
+  if (m.includes('opus'))  return process.env.ANTHROPIC_DEFAULT_OPUS_MODEL  || model;
+  if (m.includes('haiku')) return process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL || model;
+  if (m.includes('sonnet')) return process.env.ANTHROPIC_DEFAULT_SONNET_MODEL || model;
+  return model || process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
+}
+
+/** POST the Anthropic-format body to the relay verbatim (images stay inline). */
+async function callRelayHttp(body, model) {
+  const res = await fetch(`${RELAY_BASE}/v1/messages`, {
+    method: 'POST',
+    headers: {
+      'authorization': `Bearer ${RELAY_TOKEN}`,
+      'x-api-key': RELAY_TOKEN,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: body.max_tokens ?? 2048,
+      ...(body.system ? { system: body.system } : {}),
+      messages: body.messages,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`relay ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  }
+  const j = await res.json();
+  if (j.type === 'error') throw new Error(`relay error: ${JSON.stringify(j.error).slice(0, 300)}`);
+  // The relay force-enables thinking on some models, so content[0] may be a
+  // thinking block. Eval scripts read content[0].text — normalize to a single
+  // joined text block so they never see thinking.
+  const text = (j.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('');
+  return { ...j, content: [{ type: 'text', text }] };
+}
+
 /**
  * Map any model string to a CLI alias so the CLI always resolves the latest
  * snapshot (the harness defaults to a pinned name that may lag the CLI build).
@@ -64,7 +123,7 @@ function modelAlias(model) {
  */
 export function createClient(opts = {}) {
   const dryRun = !!opts.dryRun;
-  const model  = modelAlias(opts.model);
+  const model  = TRANSPORT === 'http' ? relayModelName(opts.model) : modelAlias(opts.model);
 
   /**
    * Call the model.
@@ -73,6 +132,7 @@ export function createClient(opts = {}) {
    */
   async function messages(body) {
     if (dryRun) return fakeDryRunResponse(body);
+    if (TRANSPORT === 'http') return callRelayHttp(body, model);
     return callClaudeCli(body, model);
   }
 

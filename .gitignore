@@ -1,7 +1,10 @@
 # Node / TS
 node_modules/
 dist/
+# A/B build snapshots (e.g. dist-unifont/, dist-fusion/ from the CN atlas eval)
+dist-*/
 build/
+*.tsbuildinfo
 *.log
 # pnpm is the package manager — npm's lockfile is not the source of truth
 package-lock.json
@@ -45,6 +48,9 @@ eval/gist-recall/work*/*.png
 # Eval corpus = real captured transcripts (PII: file paths, project names, and
 # message content). Keep a local copy for eval scripts, but never commit it.
 eval/corpus/
+# CN baseline renders = that same corpus as pixels — local only, like the corpus
+eval/results/cn-baseline/*.png
+eval/results/cn-baseline-fusion/*.png
 
 # Bench artifacts (events.jsonl, PNG dumps, workspaces) — one dir per run
 bench/runs/

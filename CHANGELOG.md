@@ -4,6 +4,34 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## Unreleased (pxpipe-cn fork) — 2026-07-05
+
+### Added — Chinese (CJK) adaptation
+- **Three-layer glyph atlas:** Spleen (ASCII) → Fusion Pixel 8px monospaced
+  (OFL-1.1, CJK ranges) → Unifont fallthrough with per-glyph .notdef
+  detection. Full U+4E00–9FFF coverage; zero hanzi drops on the real-session
+  CN corpus; deterministic build pinned by hash in tests.
+- **2× upscale render path for CJK-heavy blocks** (`shouldUpscaleCjk`,
+  cjkFraction ≥ 0.3): 150 cols, nearest-neighbor pixelScale=2, 2px inter-line
+  gap (`CJK_LINE_GAP`) — full page 1516×716, under the API's 1568-edge /
+  ~1.15 MP box. L1 OCR 81.7% → 93.7% from scaling alone; the 2px gap fixes
+  the packed-reflow "interlocking rows" failure (CN gist recall 39% → 75%;
+  hanzi fill the full 8px cell, unlike Latin). Shared
+  `CJK_DENSE_RENDER_STYLE` keeps gate pricing and all render sites in
+  lockstep. OpenAI path unchanged.
+- **Gate recalibration for CJK:** image side counts cells (CJK = 2) in
+  `countVisualRows`/`lineRows`; text side blends CPT_CJK=1.5
+  (`src/core/cpt.ts`, confirmed by usage-probe regression, R²=0.996);
+  min-chars thresholds are token-equivalent (a 4k-hanzi tool_result now
+  images instead of passing through). Pure-English decisions bit-identical
+  to upstream.
+- **Telemetry:** `cjk_fraction` / `cpt_used` on TrackEvent for ongoing
+  recalibration from events.jsonl.
+- **CN eval suite:** `eval/eval-cn-needle.mjs`, `eval/eval-cn-gist.mjs`,
+  `scripts/cn-baseline.mjs`, `scripts/calibrate-cn-cpt.mjs`, CN corpus
+  extraction (`--cjk`), offline `tests/cn.test.ts` (atlas coverage, cell
+  math, gate fixtures, 2× geometry). Findings: `docs/FINDINGS-cn.md`.
+
 ## 0.8.0 — 2026-07-03
 
 ### Security

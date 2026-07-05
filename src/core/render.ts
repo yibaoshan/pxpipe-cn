@@ -57,6 +57,40 @@ export const DEFAULT_CELL_H_BONUS = 0;
 export const CELL_W = ATLAS_CELL_W + DEFAULT_CELL_W_BONUS;
 export const CELL_H = ATLAS_CELL_H + DEFAULT_CELL_H_BONUS;
 
+// --- CJK 2× upscale geometry ------------------------------------------------
+// At native 5×8, hanzi OCR tops out ~82% (CN L1, 2026-07-05): the binding
+// constraint is the VLM encoder's resolving power, not glyph design. Rendering
+// the SAME atlas at 2× nearest-neighbor (each glyph px → 2×2) lifts CN accuracy
+// to 93.7% mean / 97.0% median — so CJK-heavy blocks ship at pixelScale=2.
+// The page must fit the API box (long edge ≤1568, ~1.15 MP) AFTER scaling,
+// so the pre-scale canvas halves in both axes:
+
+/** Integer upscale factor for CJK-heavy dense content (see eval/EXPERIMENT_LOG.md). */
+export const CJK_UPSCALE_FACTOR = 2;
+/** Wrap width when upscaling: 2×(2·PAD_X + 150·CELL_W) = 1516 px ≤ 1568.
+ *  (151 cols = 1526 also fits, but 150 keeps parity with the eval variant.) */
+export const CJK_DENSE_COLS = 150;
+/** Extra blank px rows between text lines in the CJK 2× style. 8px hanzi fill
+ *  the whole cell (no ascender/descender whitespace like ASCII), so gap-0
+ *  packed reflow rows visually interlock — CN gist-recall measured 39% at
+ *  gap 0 → 53% at gap 1 → 75% at gap 2 (identical facts/sessions; text arm
+ *  100%; eval/eval-cn-gist.mjs, 2026-07-05). gap 2 is where recall still
+ *  clears the profitability line (~0.60 tok/char vs ~0.67 as text). */
+export const CJK_LINE_GAP = 2;
+/** Effective CJK cell height (pre-scale px per text row). transform.ts pricing
+ *  must use THIS, not CELL_H, for the upscale branch. */
+export const CJK_CELL_H = ATLAS_CELL_H + CJK_LINE_GAP;
+/** Cell budget per upscaled page: 150 cols × 35 rows, where 35 =
+ *  floor((floor(MAX_HEIGHT_PX/2) − 2·PAD_Y) / CJK_CELL_H) — scaled height 716 ≤ 728. */
+export const CJK_DENSE_CHARS_PER_IMAGE = 5250;
+/** THE CJK-heavy dense render style. Every 2× render site and the gate's
+ *  pricing branch must key off this one object (gate/renderer lockstep). */
+export const CJK_DENSE_RENDER_STYLE: RenderStyle = {
+  ...DENSE_RENDER_STYLE,
+  cellHBonus: CJK_LINE_GAP,
+  pixelScale: CJK_UPSCALE_FACTOR,
+};
+
 export interface RenderedImage {
   png: Uint8Array;
   width: number;
@@ -91,6 +125,11 @@ export interface RenderStyle {
   /** Tint only the structural <user>/<assistant> boundary tags (body stays black)
    *  so speakers are scannable without recoloring content. Forces RGB. Composes with aa. */
   colorByRole?: boolean;
+  /** Integer post-render upscale (nearest-neighbor; each px → N×N). `maxHeightPx`
+   *  bounds the SCALED output, so row capacity divides by N. Callers must also
+   *  narrow `cols` so the scaled width fits the API box (see CJK_DENSE_COLS).
+   *  Unset/1 = off. Production uses CJK_UPSCALE_FACTOR for CJK-heavy blocks. */
+  pixelScale?: number;
 }
 
 // --- column-aware wrapping -------------------------------------------------
@@ -254,6 +293,27 @@ export function expandTabsInLine(line: string): string {
 export function measureLineCols(line: string, markerScale: number = 1): number {
   let w = 0;
   for (const ch of line) w += cellsFor(ch.codePointAt(0)!, markerScale);
+  return w;
+}
+
+/** Visual width of a line in cells, hot-path variant for the transform gate.
+ *  Same math as measureLineCols (no markerScale) with a fast path: every atlas
+ *  glyph below U+0378 is narrow (ASCII + Latin-1 + Latin Ext-A/B; the first
+ *  wide flag in the atlas is an unassigned-Greek Unifont box at U+0378), so
+ *  pure-ASCII/Latin lines skip the atlas rank lookup entirely. */
+export function lineCells(line: string): number {
+  let w = 0;
+  for (let i = 0; i < line.length; i++) {
+    const cc = line.charCodeAt(i);
+    if (cc < 0x0378) {
+      w += 1;
+      continue;
+    }
+    // Decode surrogate pairs so SMP codepoints (emoji etc.) count once.
+    const cp = cc >= 0xd800 && cc <= 0xdbff ? line.codePointAt(i)! : cc;
+    if (cp > 0xffff) i++;
+    w += cellsFor(cp);
+  }
   return w;
 }
 
@@ -457,6 +517,27 @@ function blitGlyphScaled(
 
 const GRID_INK = 25; // pre-invert → 230 post-invert; distinct from gutter divider (64 → 191)
 
+/** Nearest-neighbor integer upscale of a row-major buffer (`channels` bytes/px).
+ *  Builds each scaled row once, then block-copies it s−1 times. */
+function upscaleNearest(buf: Uint8Array, w: number, h: number, channels: number, s: number): Uint8Array {
+  const outW = w * s;
+  const out = new Uint8Array(outW * h * s * channels);
+  const rowBytes = outW * channels;
+  for (let y = 0; y < h; y++) {
+    const rowStart = y * s * rowBytes;
+    for (let x = 0; x < w; x++) {
+      const src = (y * w + x) * channels;
+      for (let sx = 0; sx < s; sx++) {
+        const dst = rowStart + (x * s + sx) * channels;
+        for (let c = 0; c < channels; c++) out[dst + c] = buf[src + c]!;
+      }
+    }
+    const row = out.subarray(rowStart, rowStart + rowBytes);
+    for (let sy = 1; sy < s; sy++) out.set(row, rowStart + sy * rowBytes);
+  }
+  return out;
+}
+
 /** Draw faint grid rules onto background pixels only (glyph ink wins). Zero pixel-cost to image size. */
 function drawGrid(
   fb: Uint8Array,
@@ -500,6 +581,7 @@ export async function renderChunkToPng(
   const atlasH = useAA ? ATLAS_GRAY_CELL_H : ATLAS_CELL_H;
   const atlasW = useAA ? ATLAS_GRAY_CELL_W : ATLAS_CELL_W;
   const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));
+  const pixelScale = Math.max(1, Math.floor(style.pixelScale ?? 1));
   const cellH = atlasH + Math.max(0, Math.floor(style.cellHBonus ?? DEFAULT_CELL_H_BONUS));
   const cellW = Math.max(1, atlasW + Math.floor(style.cellWBonus ?? DEFAULT_CELL_W_BONUS));
   const lines = wrapLines(text, cols, markerScale);
@@ -511,7 +593,8 @@ export async function renderChunkToPng(
       ? wrapLines(slotText, cols, markerScale)
       : null;
 
-  const maxLines = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH));
+  // maxHeightPx bounds the SCALED output, so the pre-scale row budget shrinks by pixelScale.
+  const maxLines = Math.max(1, Math.floor((Math.floor(maxHeightPx / pixelScale) - 2 * PAD_Y) / cellH));
   const fitLines = lines.slice(0, maxLines);
   const fitSlotLines = slotLines ? slotLines.slice(0, maxLines) : null;
 
@@ -630,6 +713,12 @@ export async function renderChunkToPng(
   // Invert to black-on-white (matches Python proxy).
   for (let i = 0; i < fb.length; i++) fb[i] = 255 - fb[i]!;
 
+  // pixelScale: blow up the finished frame N× nearest-neighbor before encoding.
+  // Crisp pixel edges on purpose — smoothing would blur the 1px strokes the
+  // whole scheme exists to preserve (CN L1: 2× lifts hanzi OCR 81.7% → 93.7%).
+  const outW = width * pixelScale;
+  const outH = height * pixelScale;
+
   let png: Uint8Array;
   if (colorMask) {
     // colorCycle / colorByRole: AA-blend each inked pixel onto white in its palette color. markerRed ignored.
@@ -651,7 +740,11 @@ export async function renderChunkToPng(
         rgb[i * 3 + 2] = g;
       }
     }
-    png = await encodeRgbPng(rgb, width, height);
+    png = await encodeRgbPng(
+      pixelScale > 1 ? upscaleNearest(rgb, width, height, 3, pixelScale) : rgb,
+      outW,
+      outH,
+    );
   } else if (markerMask) {
     // markerRed: ↵ pixels → red, everything else stays greyscale.
     const rgb = new Uint8Array(width * height * 3);
@@ -667,11 +760,19 @@ export async function renderChunkToPng(
         rgb[i * 3 + 2] = g;
       }
     }
-    png = await encodeRgbPng(rgb, width, height);
+    png = await encodeRgbPng(
+      pixelScale > 1 ? upscaleNearest(rgb, width, height, 3, pixelScale) : rgb,
+      outW,
+      outH,
+    );
   } else {
-    png = await encodeGrayPng(fb, width, height);
+    png = await encodeGrayPng(
+      pixelScale > 1 ? upscaleNearest(fb, width, height, 1, pixelScale) : fb,
+      outW,
+      outH,
+    );
   }
-  return { png, width, height, charsRendered, droppedChars, droppedCodepoints };
+  return { png, width: outW, height: outH, charsRendered, droppedChars, droppedCodepoints };
 }
 
 /** Reflow-aware variant of renderTextToPngs. Falls back to non-reflow on sentinel collision. */
@@ -694,6 +795,7 @@ export async function renderTextToPngsWithCharLimit(
   slotText?: string,
 ): Promise<RenderedImage[]> {
   const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));
+  const pixelScale = Math.max(1, Math.floor(style.pixelScale ?? 1));
   const cellH = ATLAS_CELL_H + Math.max(0, Math.floor(style.cellHBonus ?? DEFAULT_CELL_H_BONUS));
   const lines = wrapLines(text, cols, markerScale);
   // Width-identical slot rows align 1:1 with `lines`; pages are contiguous slices,
@@ -702,7 +804,8 @@ export async function renderTextToPngsWithCharLimit(
     style.colorByRole === true && slotText !== undefined
       ? wrapLines(slotText, cols, markerScale)
       : null;
-  const hardLinesPerImg = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH));
+  // Same scaled-output height budget as renderChunkToPng (maxHeightPx bounds the OUTPUT).
+  const hardLinesPerImg = Math.max(1, Math.floor((Math.floor(maxHeightPx / pixelScale) - 2 * PAD_Y) / cellH));
   // Dense pages (DENSE_CONTENT_CHARS_PER_IMAGE) fill the full 1932 px height;
   // the slab budget (READABLE_CHARS_PER_IMAGE) keeps its shorter row cap.
   const linesPerImg = Math.min(hardLinesPerImg, Math.max(1, Math.floor(maxCharsPerImage / cols)));

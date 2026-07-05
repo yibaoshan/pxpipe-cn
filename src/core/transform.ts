@@ -32,9 +32,16 @@ import {
   DENSE_CONTENT_CHARS_PER_IMAGE,
   DENSE_CONTENT_COLS,
   DENSE_RENDER_STYLE,
+  lineCells,
   renderTextToPngsWithCharLimit,
+  CJK_UPSCALE_FACTOR,
+  CJK_DENSE_COLS,
+  CJK_DENSE_CHARS_PER_IMAGE,
+  CJK_CELL_H,
+  CJK_DENSE_RENDER_STYLE,
 } from './render.js';
 import { factSheetText } from './factsheet.js';
+import { blendedCpt, blendedCptFromCounts, isCjkCodepoint, shouldUpscaleCjk } from './cpt.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
@@ -166,6 +173,16 @@ const CHARS_PER_TOKEN = 4;
  *  Slab-specific because reminders/tool_results have unknown shape; those stay at 4. */
 export const SLAB_CHARS_PER_TOKEN = 2.0;
 
+/** Token-equivalent length for English-calibrated char thresholds: scales
+ *  `text.length` by how much denser than `baseCpt` the text tokenizes.
+ *  Pure English returns `text.length` unchanged; pure CJK at CPT_CJK=1.5
+ *  returns ~2.67× length — so a 2,250-char hanzi block clears a 6,000-char
+ *  threshold that was calibrated as "≈1,500 tokens of break-even mass". */
+function tokenEquivalentChars(text: string, baseCpt: number = CHARS_PER_TOKEN): number {
+  if (text.length === 0) return 0;
+  return (text.length / blendedCpt(text, baseCpt)) * baseCpt;
+}
+
 // Tools whose stub description keeps a live-text read-before-edit precondition
 // when full docs move into the imaged Tool Reference (read-gate audit, 2026-07-03).
 const READ_FIRST_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
@@ -206,18 +223,24 @@ function multiColWidthPx(cols: number, numCols: number): number {
 
 /** Exact image-token cost for `visualRows` at given column/multi-col geometry.
  *  Mirrors the renderer's height math so the gate matches Anthropic billing.
- *  Last image is partial-height; each image cost ∝ pixel area. */
+ *  Last image is partial-height; each image cost ∝ pixel area. `pixelScale`
+ *  mirrors RenderStyle.pixelScale: output dims scale by it (pixels ×scale²)
+ *  and the per-image row budget divides by it. `cellH` mirrors the style's
+ *  effective cell height (CELL_H default; CJK_CELL_H for the 2× branch). */
 function imageTokensForRows(
   visualRows: number,
   cols: number,
   numCols: number = 1,
   imageCountCap?: number,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  pixelScale: number = 1,
+  cellH: number = CELL_H,
 ): number {
   if (!Number.isFinite(visualRows) || visualRows <= 0) return 0;
   const n = Math.max(1, numCols | 0);
-  const widthPx = multiColWidthPx(cols, n);
-  const hardLinesPerImg = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
+  const s = Math.max(1, pixelScale | 0);
+  const widthPx = multiColWidthPx(cols, n) * s;
+  const hardLinesPerImg = Math.max(1, Math.floor((Math.floor(MAX_HEIGHT_PX / s) - 2 * PAD_Y) / cellH));
   const readableLinesPerCol = Math.max(1, Math.floor(maxCharsPerImage / Math.max(1, cols)));
   const linesPerImg = Math.min(hardLinesPerImg, readableLinesPerCol);
   const rowsPerImage = linesPerImg; // pixel rows per image (height)
@@ -230,15 +253,18 @@ function imageTokensForRows(
   const linesInLast = visualRows - fullImages * linesPerImage;
   // Column-major layout: pixel rows = min(linesInLast, rowsPerImage).
   const rowsInLast = Math.min(Math.max(1, linesInLast), rowsPerImage);
-  const fullImageHeight = 2 * PAD_Y + rowsPerImage * CELL_H;
-  const lastImageHeight = 2 * PAD_Y + rowsInLast * CELL_H;
+  const fullImageHeight = (2 * PAD_Y + rowsPerImage * cellH) * s;
+  const lastImageHeight = (2 * PAD_Y + rowsInLast * cellH) * s;
   const totalPixels = fullImages * widthPx * fullImageHeight + widthPx * lastImageHeight;
   return Math.ceil((totalPixels / ANTHROPIC_PIXELS_PER_TOKEN) * IMAGE_COST_SAFETY_MARGIN);
 }
 
 /** Exact image-token cost for `text`. Uses `countVisualRows` and optionally
  *  `shrinkColsToContent` (default true) so narrow blocks aren't priced at full
- *  canvas width. Pass `shrinkWidth=false` for the system slab (fills full `cols`). */
+ *  canvas width. Pass `shrinkWidth=false` for the system slab (fills full `cols`).
+ *  CJK-heavy single-col content prices the 2× upscale geometry — the SAME
+ *  shouldUpscaleCjk predicate textToImageBlocks renders by, so the gate always
+ *  pays for the pixels it will actually emit (4× per cell, narrower page). */
 function imageTokensCost(
   text: string,
   cols: number,
@@ -247,6 +273,22 @@ function imageTokensCost(
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
 ): number {
+  // Upscale applies to the dense single-col path only: multi-col can't fit 2×
+  // width, and the slab (shrinkWidth=false) keeps its full-canvas 1× contract.
+  if (Math.max(1, numCols | 0) <= 1 && shrinkWidth && shouldUpscaleCjk(text)) {
+    const effectiveCols = shrinkColsToContent(text, CJK_DENSE_COLS);
+    // Price ↵ as inline (sentinelEndsRow=false): reflowed text PACKS, and at 2×
+    // each row costs ~2× the pixels of the 1× page — the default ↵-ends-row
+    // pessimism (harmless at 1×) would misprice packed CN blocks ~2× and flip
+    // them back to passthrough. Greedy wrap can need slightly more rows than
+    // ceil(cells/cols) when a wide glyph straddles a row edge (≤1 cell/row,
+    // <1% here) — absorbed by IMAGE_COST_SAFETY_MARGIN.
+    const rows = countVisualRows(text, effectiveCols, false);
+    return imageTokensForRows(
+      rows, effectiveCols, 1, imageCountCap,
+      CJK_DENSE_CHARS_PER_IMAGE, CJK_UPSCALE_FACTOR, CJK_CELL_H,
+    );
+  }
   const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols) : cols;
   const rows = countVisualRows(text, effectiveCols);
   return imageTokensForRows(rows, effectiveCols, numCols, imageCountCap, maxCharsPerImage);
@@ -333,7 +375,10 @@ export function evalCompressionProfitability(
     ? charsPerToken
     : CHARS_PER_TOKEN;
   const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth);
-  const textTokens = text.length / cpt;
+  // CJK-blended density: English text keeps `cpt` exactly; hanzi-heavy text
+  // drops toward CPT_CJK (~1 char/token), fixing the ~4× text-side
+  // overestimate that made profitable CN blocks look cheap-as-text.
+  const textTokens = text.length / blendedCpt(text, cpt);
   const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
     ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
     : 0;
@@ -366,7 +411,8 @@ export function isCompressionProfitable(
     ? charsPerToken
     : CHARS_PER_TOKEN;
   const imageTokensCost_ = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, maxCharsPerImage);
-  const textTokensEquivalent = text.length / cpt;
+  // CJK-blended density — see evalCompressionProfitability.
+  const textTokensEquivalent = text.length / blendedCpt(text, cpt);
   // Symmetric burn penalty (anti-flapping): switching modes invalidates the warm
   // cache on whichever side was warm, paying cache_create. Burn is added to the
   // side that would flip — pinning the session in its current mode until
@@ -411,7 +457,8 @@ export function isCompressionProfitableAmortized(
     ? charsPerToken
     : CHARS_PER_TOKEN;
   const imageTokens = imageTokensCost(text, cols, n, imageCountCap, shrinkWidth, maxCharsPerImage);
-  const textTokens = text.length / cpt;
+  // CJK-blended density — see evalCompressionProfitability.
+  const textTokens = text.length / blendedCpt(text, cpt);
   // Worst-case-for-image vs best-case-for-text (conservative, on purpose).
   const imageLifetime = imageTokens * (CACHE_CREATE_RATE + CACHE_READ_RATE * (N - 1));
   const textLifetime = textTokens * CACHE_READ_RATE * N;
@@ -549,6 +596,13 @@ export interface TransformInfo {
   droppedChars?: number;
   /** Top dropped codepoints by frequency (`U+HHHH` → count), at most 20 entries. */
   droppedCodepointsTop?: Record<string, number>;
+  /** Fraction of non-whitespace codepoints in CJK ranges across the combined
+   *  request text. Request-level; feeds ongoing CPT_CJK recalibration from
+   *  events.jsonl (regress baseline_tokens on cjk/other char counts). */
+  cjkFraction?: number;
+  /** Blended chars-per-token the gates used for this request's combined text
+   *  (base o.charsPerToken folded with CPT_CJK). Equals charsPerToken on pure-EN. */
+  cptUsed?: number;
   /** Why blocks passed through without compression. Only present when count > 0. */
   passthroughReasons?: { below_threshold?: number; not_profitable?: number; kept_sharp?: number };
   /** Slab gate diagnostics — imageTokens, textTokens, burn terms, and verdict.
@@ -1057,24 +1111,30 @@ function makeImageBlock(pngB64: string, _ephemeral = false): ImageBlock {
 // Anthropic caps requests at 100 images. Huge tool_results (find trees,
 // log dumps) are truncated with a paging marker before render.
 
-/** Visual rows a single input line will consume after soft-wrap at `cols`. */
+/** Visual rows a single input line will consume after soft-wrap at `cols`.
+ *  Cell-aware: CJK wide glyphs occupy 2 cells (matches render.ts wrapLines),
+ *  so pure-Chinese lines cost ~2× the rows of same-length ASCII. */
 function lineRows(line: string, cols: number): number {
-  return Math.max(1, Math.ceil(line.length / cols));
+  return Math.max(1, Math.ceil(lineCells(line) / cols));
 }
 
 /** Visual row count after soft-wrap at `cols`. Both `\n` and the ↵ sentinel
- *  end a row; ↵ occupies a cell on the line it terminates. */
-function countVisualRows(text: string, cols: number): number {
+ *  end a row; ↵ occupies a cell on the line it terminates. Cell-aware (see
+ *  lineRows) so the image-cost estimate doesn't undercount CJK ~2×.
+ *  `sentinelEndsRow=false` prices ↵ as an INLINE glyph instead — matching what
+ *  wrapLines actually does with reflowed text (pack, never break). The default
+ *  stays pessimistic to preserve upstream English gate decisions bit-for-bit. */
+function countVisualRows(text: string, cols: number, sentinelEndsRow: boolean = true): number {
   let rows = 0;
   let lineStart = 0;
   const len = text.length;
   for (let i = 0; i <= len; i++) {
     const cc = i < len ? text.charCodeAt(i) : -1;
-    const isSentinel = cc === 0x21b5 /* ↵ */;
+    const isSentinel = sentinelEndsRow && cc === 0x21b5 /* ↵ */;
     if (i === len || cc === 10 /* \n */ || isSentinel) {
-      // ↵ renders as a glyph on the line it ends — count it in the length.
-      const lineLen = (isSentinel ? i + 1 : i) - lineStart;
-      rows += Math.max(1, Math.ceil(lineLen / cols));
+      // ↵ renders as a glyph on the line it ends — include it in the slice.
+      const cells = lineCells(text.slice(lineStart, isSentinel ? i + 1 : i));
+      rows += Math.max(1, Math.ceil(cells / cols));
       lineStart = i + 1;
     }
   }
@@ -1106,6 +1166,10 @@ export function estimateImageCount(
   return Math.max(
     1,
     Math.ceil(rows / linesPerImage),
+    // Raw chars on purpose: mirrors the renderer's per-page charLimit
+    // (splitWrappedLinesIntoReadablePages counts line.length, not cells).
+    // CJK correctness comes from the cell-aware rows clause above, which
+    // always dominates for wide text (2 cells/char ⇒ ~2× rows).
     Math.ceil(textOrLen.length / charBudget),
   );
 }
@@ -1172,6 +1236,13 @@ export function truncateForBudget(
   maxCharsPerImage: number = DENSE_CONTENT_CHARS_PER_IMAGE,
 ): { text: string; omittedChars: number; truncated: boolean } {
   const n = Math.max(1, numCols | 0);
+  // Mirror imageTokensCost/textToImageBlocks: CJK-heavy single-col content
+  // renders at the 2× page (150 cols × 35 rows at CJK_CELL_H), so budget
+  // against THAT geometry or the truncation would overshoot the image cap ~4×.
+  if (n <= 1 && shouldUpscaleCjk(text)) {
+    cols = CJK_DENSE_COLS;
+    maxCharsPerImage = CJK_DENSE_CHARS_PER_IMAGE;
+  }
   const estImages = estimateImageCount(text, cols, n, maxCharsPerImage);
   if (estImages <= maxImages) return { text, omittedChars: 0, truncated: false };
   const readableLinesPerCol = Math.max(1, Math.floor(maxCharsPerImage / Math.max(1, cols)));
@@ -1316,8 +1387,19 @@ export async function textToImageBlocks(
   // If shrinkage drops below the full width, stay single-col (avoid wasting a divider column).
   const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols) : cols;
   const effectiveNumCols = effectiveCols < cols ? 1 : numCols;
+  // CJK-heavy dense content renders at 2× — MUST mirror imageTokensCost's branch
+  // exactly (same predicate, same raw-numCols/shrinkWidth condition) so the gate
+  // priced the pixels this render actually emits.
+  const upscale = Math.max(1, numCols | 0) <= 1 && shrinkWidth && shouldUpscaleCjk(text);
   const imgs =
-    effectiveNumCols > 1
+    upscale
+      ? await renderTextToPngsWithCharLimit(
+          text,
+          shrinkColsToContent(text, CJK_DENSE_COLS),
+          CJK_DENSE_CHARS_PER_IMAGE,
+          CJK_DENSE_RENDER_STYLE,
+        )
+      : effectiveNumCols > 1
       ? await renderTextToPngsMultiCol(text, effectiveCols, effectiveNumCols)
       // Single-col dense: shrink the 384-col base to content so the renderer matches the
       // gate (denseGateGeometry uses DENSE_CONTENT_COLS, priced via shrinkColsToContent).
@@ -1480,6 +1562,17 @@ export async function transformRequest(
   } catch (e) {
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
+  }
+
+  // CJK telemetry on the ORIGINAL request (pairs with baseline_tokens for
+  // ongoing CPT_CJK recalibration from events.jsonl). Only emitted when the
+  // request actually contains CJK, keeping pure-EN rows lean.
+  {
+    const st = requestCjkStats(req);
+    if (st.cjk > 0 && st.nonWs > 0) {
+      info.cjkFraction = Number((st.cjk / st.nonWs).toFixed(4));
+      info.cptUsed = Number(blendedCptFromCounts(st.chars, st.cjk, o.charsPerToken).toFixed(3));
+    }
   }
 
   // 1. Pull system text out. Split into:
@@ -1792,7 +1885,8 @@ export async function transformRequest(
             processedExisting.push(blk);
             continue;
           }
-          const textLen = (blk as TextBlock).text.length;
+          // Token-equivalent so CJK blocks half the codepoint length still qualify.
+          const textLen = tokenEquivalentChars((blk as TextBlock).text, o.charsPerToken);
           if (textLen < o.minReminderChars) {
             // Below coarse threshold; can't possibly be profitable. Skip.
             bumpPassthrough(info, 'below_threshold');
@@ -1881,7 +1975,8 @@ export async function transformRequest(
               const inner = compactSlabWhitespace(innerRaw);
               // classifyContent sees pre-reflow `inner` so shape bucketing reflects real structure.
               const innerR = maybeReflow(inner, o.reflow);
-              if (innerR.length < o.minToolResultChars) {
+              // Token-equivalent threshold — CJK-heavy results qualify at ~len/2.67.
+              if (tokenEquivalentChars(innerR, o.charsPerToken) < o.minToolResultChars) {
                 bumpPassthrough(info, 'below_threshold');
                 rewritten.push(blk);
               } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, numCols, o.charsPerToken, 0, 0, true, denseGeo.maxChars)) {
@@ -1945,7 +2040,8 @@ export async function transformRequest(
                 const innerText = compactSlabWhitespace(innerTextRaw);
                 // R3: gate/page/render on reflowed text; classify pre-reflow.
                 const innerTextR = maybeReflow(innerText, o.reflow);
-                if (innerTextR.length < o.minToolResultChars) {
+                // Token-equivalent threshold — CJK-heavy results qualify at ~len/2.67.
+                if (tokenEquivalentChars(innerTextR, o.charsPerToken) < o.minToolResultChars) {
                   bumpPassthrough(info, 'below_threshold');
                   newInner.push(ib as TextBlock | ImageBlock);
                   continue;
@@ -2141,15 +2237,40 @@ export async function transformRequest(
  *  `tokens ≈ α·outgoingTextChars + β·imagePixels` regression. */
 function countOutgoingTextChars(req: MessagesRequest): number {
   let n = 0;
+  forEachRequestText(req, (s) => { n += s.length; });
+  return n;
+}
 
+/** CJK stats over the same text coverage as countOutgoingTextChars. Run on
+ *  the ORIGINAL parsed request so cjk_fraction pairs with baseline_tokens
+ *  (also original-body) in events.jsonl for CPT_CJK recalibration. */
+function requestCjkStats(req: MessagesRequest): { chars: number; cjk: number; nonWs: number } {
+  let chars = 0;
+  let cjk = 0;
+  let nonWs = 0;
+  forEachRequestText(req, (s) => {
+    chars += s.length;
+    for (let i = 0; i < s.length; i++) {
+      const cc = s.charCodeAt(i);
+      if (cc <= 0x20) continue; // whitespace/control doesn't dilute the ratio
+      nonWs++;
+      if (isCjkCodepoint(cc)) cjk++;
+    }
+  });
+  return { chars, cjk, nonWs };
+}
+
+/** Visit every TEXT string the upstream tokenizer will see (system, tools,
+ *  messages). Excludes image base64 and redacted_thinking. */
+function forEachRequestText(req: MessagesRequest, visit: (s: string) => void): void {
   // 1. system field
   const sys = req.system;
   if (typeof sys === 'string') {
-    n += sys.length;
+    visit(sys);
   } else if (Array.isArray(sys)) {
     for (const b of sys) {
       if (b && (b as TextBlock).type === 'text' && typeof (b as TextBlock).text === 'string') {
-        n += (b as TextBlock).text.length;
+        visit((b as TextBlock).text);
       }
     }
   }
@@ -2158,10 +2279,10 @@ function countOutgoingTextChars(req: MessagesRequest): number {
   if (Array.isArray(req.tools)) {
     for (const tool of req.tools) {
       if (!tool || typeof tool !== 'object') continue;
-      if (typeof tool.name === 'string') n += tool.name.length;
-      if (typeof tool.description === 'string') n += tool.description.length;
+      if (typeof tool.name === 'string') visit(tool.name);
+      if (typeof tool.description === 'string') visit(tool.description);
       if (tool.input_schema !== undefined) {
-        n += safeStringifyLen(tool.input_schema);
+        visit(safeStringify(tool.input_schema));
       }
     }
   }
@@ -2170,7 +2291,7 @@ function countOutgoingTextChars(req: MessagesRequest): number {
   for (const msg of req.messages ?? []) {
     const c = msg.content;
     if (typeof c === 'string') {
-      n += c.length;
+      visit(c);
       continue;
     }
     if (!Array.isArray(c)) continue;
@@ -2180,27 +2301,27 @@ function countOutgoingTextChars(req: MessagesRequest): number {
 
       if (type === 'text') {
         const tb = b as TextBlock;
-        if (typeof tb.text === 'string') n += tb.text.length;
+        if (typeof tb.text === 'string') visit(tb.text);
         continue;
       }
 
       if (type === 'tool_use') {
         const tu = b as ToolUseBlock;
-        if (typeof tu.name === 'string') n += tu.name.length;
-        if (tu.input !== undefined) n += safeStringifyLen(tu.input);
+        if (typeof tu.name === 'string') visit(tu.name);
+        if (tu.input !== undefined) visit(safeStringify(tu.input));
         continue;
       }
 
       if (type === 'tool_result') {
         const tr = b as ToolResultBlock;
-        if (typeof tr.tool_use_id === 'string') n += tr.tool_use_id.length;
+        if (typeof tr.tool_use_id === 'string') visit(tr.tool_use_id);
         const inner = tr.content;
         if (typeof inner === 'string') {
-          n += inner.length;
+          visit(inner);
         } else if (Array.isArray(inner)) {
           for (const ib of inner) {
             if (ib && (ib as TextBlock).type === 'text' && typeof (ib as TextBlock).text === 'string') {
-              n += (ib as TextBlock).text.length;
+              visit((ib as TextBlock).text);
             }
           }
         }
@@ -2209,22 +2330,20 @@ function countOutgoingTextChars(req: MessagesRequest): number {
 
       if (type === 'thinking') {
         const th = b as unknown as { thinking?: unknown };
-        if (typeof th.thinking === 'string') n += (th.thinking as string).length;
+        if (typeof th.thinking === 'string') visit(th.thinking as string);
         continue;
       }
 
       // image, redacted_thinking, server_tool_use, etc. — skip.
     }
   }
-
-  return n;
 }
 
-/** JSON.stringify length, tolerant of cycles. Returns 0 on error. */
-function safeStringifyLen(v: unknown): number {
+/** JSON.stringify, tolerant of cycles. Returns '' on error. */
+function safeStringify(v: unknown): string {
   try {
-    return JSON.stringify(v)?.length ?? 0;
+    return JSON.stringify(v) ?? '';
   } catch {
-    return 0;
+    return '';
   }
 }

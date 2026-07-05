@@ -12,7 +12,8 @@
  */
 
 import type { CacheControl, ContentBlock, ImageBlock, Message, TextBlock, ToolUseBlock, ToolResultBlock } from './types.js';
-import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER } from './render.js';
+import { CJK_DENSE_CHARS_PER_IMAGE, CJK_DENSE_COLS, CJK_DENSE_RENDER_STYLE, DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER } from './render.js';
+import { shouldUpscaleCjk } from './cpt.js';
 import { factSheetText } from './factsheet.js';
 import { bytesToBase64 } from './png.js';
 
@@ -600,11 +601,17 @@ export async function collapseHistory(
     // colorByRole tints the structural <role> tags so turn boundaries are scannable
     // in the history image; it's token-free (vision cost is by pixel dims, not PNG
     // byte depth) and carries the serialize-time slot string instead of re-parsing.
+    // CJK-heavy chunks render at the 2× upscale geometry (same shouldUpscaleCjk
+    // predicate the profitability gate prices by — see transform.ts imageTokensCost);
+    // pixelScale composes with colorByRole (post-render buffer scale).
+    const upscale = shouldUpscaleCjk(chunkRender);
     const imgs = await renderTextToPngsWithCharLimit(
       chunkRender,
-      DENSE_CONTENT_COLS,
-      DENSE_CONTENT_CHARS_PER_IMAGE,
-      { ...DENSE_RENDER_STYLE, colorByRole: true },
+      upscale ? CJK_DENSE_COLS : DENSE_CONTENT_COLS,
+      upscale ? CJK_DENSE_CHARS_PER_IMAGE : DENSE_CONTENT_CHARS_PER_IMAGE,
+      upscale
+        ? { ...CJK_DENSE_RENDER_STYLE, colorByRole: true }
+        : { ...DENSE_RENDER_STYLE, colorByRole: true },
       undefined,
       chunkSlot,
     );

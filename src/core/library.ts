@@ -10,8 +10,12 @@ import {
   DENSE_CONTENT_CHARS_PER_IMAGE,
   DENSE_RENDER_STYLE,
   MAX_HEIGHT_PX,
+  CJK_DENSE_COLS,
+  CJK_DENSE_CHARS_PER_IMAGE,
+  CJK_DENSE_RENDER_STYLE,
   type RenderStyle,
 } from './render.js';
+import { shouldUpscaleCjk } from './cpt.js';
 import {
   transformRequest,
   type TransformInfo,
@@ -221,9 +225,28 @@ export async function renderTextToImages(
       : Math.max(1, opts.multiCol | 0);
   const numCols = cols < maxCols ? 1 : requestedCols;
 
+  // CJK-heavy content exports at the 2× upscale geometry — mirrors the proxy's
+  // textToImageBlocks (same shouldUpscaleCjk predicate) so `pxpipe export` PNGs
+  // stay identical to what the proxy actually ships. Only when the caller kept
+  // the default style/geometry: explicit style/cols/maxChars are respected as-is.
+  const upscale =
+    numCols <= 1 &&
+    opts.style === undefined &&
+    opts.cols === undefined &&
+    opts.maxCharsPerImage === undefined &&
+    shouldUpscaleCjk(source);
+
   const imgs =
     numCols > 1
       ? await renderTextToPngsMultiCol(source, cols, numCols)
+      : upscale
+      ? await renderTextToPngsWithCharLimit(
+          source,
+          Math.min(cols, CJK_DENSE_COLS),
+          CJK_DENSE_CHARS_PER_IMAGE,
+          CJK_DENSE_RENDER_STYLE,
+          maxHeightPx,
+        )
       : await renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
 
   let droppedChars = 0;

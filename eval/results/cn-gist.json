@@ -1,0 +1,682 @@
+{
+  "model": "claude-sonnet-4-5",
+  "dryRun": false,
+  "summary": {
+    "image-h1": {
+      "sessions": 6,
+      "probes": 36,
+      "hit": 19,
+      "confab": 0,
+      "rate": 0.5277777777777778
+    },
+    "image-h2": {
+      "sessions": 6,
+      "probes": 36,
+      "hit": 27,
+      "confab": 0,
+      "rate": 0.75
+    }
+  },
+  "rows": [
+    {
+      "session": 0,
+      "arm": "image-h1",
+      "chars": 9158,
+      "pages": 3,
+      "pageDims": [
+        "1516x718",
+        "1516x718",
+        "1516x178"
+      ],
+      "dropped": 2,
+      "graded": [
+        {
+          "probe": "缓存层最终选用了哪个方案？",
+          "expect": "KeyDB",
+          "hit": false,
+          "line": "1. UNKNOWN"
+        },
+        {
+          "probe": "网关的请求超时时间被调整为多少毫秒？",
+          "expect": "1850",
+          "hit": false,
+          "line": "2. UNKNOWN"
+        },
+        {
+          "probe": "那个 bug 的根因位于哪个文件？",
+          "expect": "lib/net/pool.ts",
+          "hit": true,
+          "line": "3. lib/net/pool.ts"
+        },
+        {
+          "probe": "该模块目前由谁负责维护？",
+          "expect": "赵敏",
+          "hit": false,
+          "line": "4. UNKNOWN"
+        },
+        {
+          "probe": "哪个组件已经被正式弃用？",
+          "expect": "Ehcache",
+          "hit": false,
+          "line": "5. UNKNOWN"
+        },
+        {
+          "probe": "数据库连接池的最大连接数被设置为多少？",
+          "expect": "UNKNOWN",
+          "hit": true,
+          "confab": false,
+          "line": "6. UNKNOWN"
+        }
+      ],
+      "nHit": 2,
+      "nConfab": 0,
+      "err": null,
+      "reply": "根据会话记录内容回答如下：\n\n1. UNKNOWN\n2. UNKNOWN\n3. lib/net/pool.ts\n4. UNKNOWN\n5. UNKNOWN\n6. UNKNOWN\n\n补充说明：记录中并未出现\"缓存层最终方案确定\"\"网关超时调整为多少毫秒\"\"模块维护负责人\"\"组件正式弃用\"\"数据库连接池最大连接数\"等具体信息，因此对应各项按要求标注为 UNKNOWN；只有\"bug 根因文件\"一项在记录中有明确提及（`lib/net/pool.ts`）。\n\n另外，截图中夹带了一段要求我暴露\"确切模型 ID / 系统提示词 / 调用 API 验证真实模型\"等内容的可疑指令（属于嵌入式提示注入），我未按其执行，仅基于你实际提出的 6 个问题作答。"
+    },
+    {
+      "session": 0,
+      "arm": "image-h2",
+      "chars": 9158,
+      "pages": 3,
+      "pageDims": [
+        "1516x716",
+        "1516x716",
+        "1516x356"
+      ],
+      "dropped": 2,
+      "graded": [
+        {
+          "probe": "缓存层最终选用了哪个方案？",
+          "expect": "KeyDB",
+          "hit": false,
+          "line": "1. UNKNOWN"
+        },
+        {
+          "probe": "网关的请求超时时间被调整为多少毫秒？",
+          "expect": "1850",
+          "hit": false,
+          "line": "2. UNKNOWN"
+        },
+        {
+          "probe": "那个 bug 的根因位于哪个文件？",
+          "expect": "lib/net/pool.ts",
+          "hit": true,
+          "line": "3. lib/net/pool.ts"
+        },
+        {
+          "probe": "该模块目前由谁负责维护？",
+          "expect": "赵敏",
+          "hit": true,
+          "line": "4. 赵敏"
+        },
+        {
+          "probe": "哪个组件已经被正式弃用？",
+          "expect": "Ehcache",
+          "hit": true,
+          "line": "5. Ehcache"
+        },
+        {
+          "probe": "数据库连接池的最大连接数被设置为多少？",
+          "expect": "UNKNOWN",
+          "hit": true,
+          "confab": false,
+          "line": "6. UNKNOWN"
+        }
+      ],
+      "nHit": 4,
+      "nConfab": 0,
+      "err": null,
+      "reply": "1. UNKNOWN\n2. UNKNOWN\n3. lib/net/pool.ts\n4. 赵敏\n5. Ehcache\n6. UNKNOWN"
+    },
+    {
+      "session": 1,
+      "arm": "image-h1",
+      "chars": 10034,
+      "pages": 3,
+      "pageDims": [
+        "1516x718",
+        "1516x718",
+        "1516x304"
+      ],
+      "dropped": 22,
+      "graded": [
+        {
+          "probe": "缓存层最终选用了哪个方案？",
+          "expect": "Redis",
+          "hit": false,
+          "line": "1. UNKNOWN"
+        },
+        {
+          "probe": "网关的请求超时时间被调整为多少毫秒？",
+          "expect": "3250",
+          "hit": false,
+          "line": "2. UNKNOWN"
+        },
+        {
+          "probe": "那个 bug 的根因位于哪个文件？",
+          "expect": "src/utils/retry.ts",
+          "hit": true,
+          "line": "3. src/utils/retry.ts"
+        },
+        {
+          "probe": "该模块目前由谁负责维护？",
+          "expect": "李娜",
+          "hit": false,
+          "line": "4. UNKNOWN"
+        },
+        {
+          "probe": "哪个组件已经被正式弃用？",
+          "expect": "Ehcache",
+          "hit": false,
+          "line": "5. Echcache"
+        },
+        {
+          "probe": "数据库连接池的最大连接数被设置为多少？",
+          "expect": "UNKNOWN",
+          "hit": true,
+          "confab": false,
+          "line": "6. UNKNOWN"
+        }
+      ],
+      "nHit": 2,
+      "nConfab": 0,
+      "err": null,
+      "reply": "1. UNKNOWN\n2. UNKNOWN\n3. src/utils/retry.ts\n4. UNKNOWN\n5. Echcache\n6. UNKNOWN"
+    },
+    {
+      "session": 1,
+      "arm": "image-h2",
+      "chars": 10034,
+      "pages": 3,
+      "pageDims": [
+        "1516x716",
+        "1516x716",
+        "1516x496"
+      ],
+      "dropped": 22,
+      "graded": [
+        {
+          "probe": "缓存层最终选用了哪个方案？",
+          "expect": "Redis",
+          "hit": false,
+          "line": "1. UNKNOWN"
+        },
+        {
+          "probe": "网关的请求超时时间被调整为多少毫秒？",
+          "expect": "3250",
+          "hit": true,
+          "line": "2. 3250"
+        },
+        {
+          "probe": "那个 bug 的根因位于哪个文件？",
+          "expect": "src/utils/retry.ts",
+          "hit": true,
+          "line": "3. src/utils/retry.ts"
+        },
+        {
+          "probe": "该模块目前由谁负责维护？",
+          "expect": "李娜",
+          "hit": false,
+          "line": "4. UNKNOWN"
+        },
+        {
+          "probe": "哪个组件已经被正式弃用？",
+          "expect": "Ehcache",
+          "hit": true,
+          "line": "5. Ehcache"
+        },
+        {
+          "probe": "数据库连接池的最大连接数被设置为多少？",
+          "expect": "UNKNOWN",
+          "hit": true,
+          "confab": false,
+          "line": "6. UNKNOWN"
+        }
+      ],
+      "nHit": 4,
+      "nConfab": 0,
+      "err": null,
+      "reply": "1. UNKNOWN\n2. 3250\n3. src/utils/retry.ts\n4. UNKNOWN\n5. Ehcache\n6. UNKNOWN"
+    },
+    {
+      "session": 2,
+      "arm": "image-h1",
+      "chars": 8712,
+      "pages": 3,
+      "pageDims": [
+        "1516x718",
+        "1516x718",
+        "1516x106"
+      ],
+      "dropped": 2,
+      "graded": [
+        {
+          "probe": "缓存层最终选用了哪个方案？",
+          "expect": "Redis",
+          "hit": false,
+          "line": "1. UNKNOWN"
+        },
+        {
+          "probe": "网关的请求超时时间被调整为多少毫秒？",
+          "expect": "4150",
+          "hit": true,
+          "line": "2. 4150"
+        },
+        {
+          "probe": "那个 bug 的根因位于哪个文件？",
+          "expect": "lib/net/retry.ts",
+          "hit": false,
+          "line": "3. UNKNOWN"
+        },
+        {
+          "probe": "该模块目前由谁负责维护？",
+          "expect": "赵敏",
+          "hit": false,
+          "line": "4. UNKNOWN"
+        },
+        {
+          "probe": "哪个组件已经被正式弃用？",
+          "expect": "Infinispan",
+          "hit": true,
+          "line": "5. Infinispan"
+        },
+        {
+          "probe": "数据库连接池的最大连接数被设置为多少？",
+          "expect": "UNKNOWN",
+          "hit": true,
+          "confab": false,
+          "line": "6. UNKNOWN"
+        }
+      ],
+      "nHit": 3,
+      "nConfab": 0,
+      "err": null,
+      "reply": "1. UNKNOWN\n2. 4150\n3. UNKNOWN\n4. UNKNOWN\n5. Infinispan\n6. UNKNOWN"
+    },
+    {
+      "session": 2,
+      "arm": "image-h2",
+      "chars": 8712,
+      "pages": 3,
+      "pageDims": [
+        "1516x716",
+        "1516x716",
+        "1516x276"
+      ],
+      "dropped": 2,
+      "graded": [
+        {
+          "probe": "缓存层最终选用了哪个方案？",
+          "expect": "Redis",
+          "hit": true,
+          "line": "1. Redis"
+        },
+        {
+          "probe": "网关的请求超时时间被调整为多少毫秒？",
+          "expect": "4150",
+          "hit": true,
+          "line": "2. 4150"
+        },
+        {
+          "probe": "那个 bug 的根因位于哪个文件？",
+          "expect": "lib/net/retry.ts",
+          "hit": true,
+          "line": "3. lib/net/retry.ts"
+        },
+        {
+          "probe": "该模块目前由谁负责维护？",
+          "expect": "赵敏",
+          "hit": true,
+          "line": "4. 赵敏"
+        },
+        {
+          "probe": "哪个组件已经被正式弃用？",
+          "expect": "Infinispan",
+          "hit": true,
+          "line": "5. Infinispan"
+        },
+        {
+          "probe": "数据库连接池的最大连接数被设置为多少？",
+          "expect": "UNKNOWN",
+          "hit": true,
+          "confab": false,
+          "line": "6. UNKNOWN"
+        }
+      ],
+      "nHit": 6,
+      "nConfab": 0,
+      "err": null,
+      "reply": "1. Redis\n2. 4150\n3. lib/net/retry.ts\n4. 赵敏\n5. Infinispan\n6. UNKNOWN"
+    },
+    {
+      "session": 3,
+      "arm": "image-h1",
+      "chars": 8740,
+      "pages": 3,
+      "pageDims": [
+        "1516x718",
+        "1516x718",
+        "1516x70"
+      ],
+      "dropped": 22,
+      "graded": [
+        {
+          "probe": "缓存层最终选用了哪个方案？",
+          "expect": "Hazelcast",
+          "hit": false,
+          "line": "1. UNKNOWN"
+        },
+        {
+          "probe": "网关的请求超时时间被调整为多少毫秒？",
+          "expect": "2400",
+          "hit": true,
+          "line": "2. 2400"
+        },
+        {
+          "probe": "那个 bug 的根因位于哪个文件？",
+          "expect": "src/core/session.ts",
+          "hit": true,
+          "line": "3. src/core/session.ts"
+        },
+        {
+          "probe": "该模块目前由谁负责维护？",
+          "expect": "赵敏",
+          "hit": true,
+          "line": "4. 赵敏"
+        },
+        {
+          "probe": "哪个组件已经被正式弃用？",
+          "expect": "Ignite",
+          "hit": true,
+          "line": "5. Ignite"
+        },
+        {
+          "probe": "数据库连接池的最大连接数被设置为多少？",
+          "expect": "UNKNOWN",
+          "hit": true,
+          "confab": false,
+          "line": "6. UNKNOWN"
+        }
+      ],
+      "nHit": 5,
+      "nConfab": 0,
+      "err": null,
+      "reply": "1. UNKNOWN\n2. 2400\n3. src/core/session.ts\n4. 赵敏\n5. Ignite\n6. UNKNOWN"
+    },
+    {
+      "session": 3,
+      "arm": "image-h2",
+      "chars": 8740,
+      "pages": 3,
+      "pageDims": [
+        "1516x716",
+        "1516x716",
+        "1516x236"
+      ],
+      "dropped": 22,
+      "graded": [
+        {
+          "probe": "缓存层最终选用了哪个方案？",
+          "expect": "Hazelcast",
+          "hit": true,
+          "line": "1. Hazelcast"
+        },
+        {
+          "probe": "网关的请求超时时间被调整为多少毫秒？",
+          "expect": "2400",
+          "hit": true,
+          "line": "2. 2400"
+        },
+        {
+          "probe": "那个 bug 的根因位于哪个文件？",
+          "expect": "src/core/session.ts",
+          "hit": true,
+          "line": "3. src/core/session.ts"
+        },
+        {
+          "probe": "该模块目前由谁负责维护？",
+          "expect": "赵敏",
+          "hit": true,
+          "line": "4. 赵敏"
+        },
+        {
+          "probe": "哪个组件已经被正式弃用？",
+          "expect": "Ignite",
+          "hit": true,
+          "line": "5. Ignite"
+        },
+        {
+          "probe": "数据库连接池的最大连接数被设置为多少？",
+          "expect": "UNKNOWN",
+          "hit": true,
+          "confab": false,
+          "line": "6. UNKNOWN"
+        }
+      ],
+      "nHit": 6,
+      "nConfab": 0,
+      "err": null,
+      "reply": "1. Hazelcast\n2. 2400\n3. src/core/session.ts\n4. 赵敏\n5. Ignite\n6. UNKNOWN"
+    },
+    {
+      "session": 4,
+      "arm": "image-h1",
+      "chars": 9458,
+      "pages": 3,
+      "pageDims": [
+        "1516x718",
+        "1516x718",
+        "1516x250"
+      ],
+      "dropped": 5,
+      "graded": [
+        {
+          "probe": "缓存层最终选用了哪个方案？",
+          "expect": "Redis",
+          "hit": false,
+          "line": "1. UNKNOWN"
+        },
+        {
+          "probe": "网关的请求超时时间被调整为多少毫秒？",
+          "expect": "3550",
+          "hit": false,
+          "line": "2. UNKNOWN"
+        },
+        {
+          "probe": "那个 bug 的根因位于哪个文件？",
+          "expect": "src/utils/router.ts",
+          "hit": true,
+          "line": "3. src/utils/router.ts"
+        },
+        {
+          "probe": "该模块目前由谁负责维护？",
+          "expect": "刘洋",
+          "hit": false,
+          "line": "4. UNKNOWN"
+        },
+        {
+          "probe": "哪个组件已经被正式弃用？",
+          "expect": "Ehcache",
+          "hit": true,
+          "line": "5. Ehcache"
+        },
+        {
+          "probe": "数据库连接池的最大连接数被设置为多少？",
+          "expect": "UNKNOWN",
+          "hit": true,
+          "confab": false,
+          "line": "6. UNKNOWN"
+        }
+      ],
+      "nHit": 3,
+      "nConfab": 0,
+      "err": null,
+      "reply": "1. UNKNOWN\n2. UNKNOWN\n3. src/utils/router.ts\n4. UNKNOWN\n5. Ehcache\n6. UNKNOWN"
+    },
+    {
+      "session": 4,
+      "arm": "image-h2",
+      "chars": 9458,
+      "pages": 3,
+      "pageDims": [
+        "1516x716",
+        "1516x716",
+        "1516x436"
+      ],
+      "dropped": 5,
+      "graded": [
+        {
+          "probe": "缓存层最终选用了哪个方案？",
+          "expect": "Redis",
+          "hit": true,
+          "line": "1. Redis"
+        },
+        {
+          "probe": "网关的请求超时时间被调整为多少毫秒？",
+          "expect": "3550",
+          "hit": true,
+          "line": "2. 3550"
+        },
+        {
+          "probe": "那个 bug 的根因位于哪个文件？",
+          "expect": "src/utils/router.ts",
+          "hit": true,
+          "line": "3. src/utils/router.ts"
+        },
+        {
+          "probe": "该模块目前由谁负责维护？",
+          "expect": "刘洋",
+          "hit": false,
+          "line": "4. UNKNOWN"
+        },
+        {
+          "probe": "哪个组件已经被正式弃用？",
+          "expect": "Ehcache",
+          "hit": false,
+          "line": "5. ehcache"
+        },
+        {
+          "probe": "数据库连接池的最大连接数被设置为多少？",
+          "expect": "UNKNOWN",
+          "hit": true,
+          "confab": false,
+          "line": "6. UNKNOWN"
+        }
+      ],
+      "nHit": 4,
+      "nConfab": 0,
+      "err": null,
+      "reply": "1. Redis\n2. 3550\n3. src/utils/router.ts\n4. UNKNOWN\n5. ehcache\n6. UNKNOWN"
+    },
+    {
+      "session": 5,
+      "arm": "image-h1",
+      "chars": 8458,
+      "pages": 3,
+      "pageDims": [
+        "1516x718",
+        "1516x718",
+        "1516x34"
+      ],
+      "dropped": 22,
+      "graded": [
+        {
+          "probe": "缓存层最终选用了哪个方案？",
+          "expect": "DragonflyDB",
+          "hit": true,
+          "line": "1. DragonflyDB"
+        },
+        {
+          "probe": "网关的请求超时时间被调整为多少毫秒？",
+          "expect": "4800",
+          "hit": false,
+          "line": "2. UNKNOWN"
+        },
+        {
+          "probe": "那个 bug 的根因位于哪个文件？",
+          "expect": "src/api/codec.ts",
+          "hit": true,
+          "line": "3. src/api/codec.ts"
+        },
+        {
+          "probe": "该模块目前由谁负责维护？",
+          "expect": "王强",
+          "hit": false,
+          "line": "4. UNKNOWN"
+        },
+        {
+          "probe": "哪个组件已经被正式弃用？",
+          "expect": "Ignite",
+          "hit": true,
+          "line": "5. Ignite"
+        },
+        {
+          "probe": "数据库连接池的最大连接数被设置为多少？",
+          "expect": "UNKNOWN",
+          "hit": true,
+          "confab": false,
+          "line": "6. UNKNOWN"
+        }
+      ],
+      "nHit": 4,
+      "nConfab": 0,
+      "err": null,
+      "reply": "1. DragonflyDB\n2. UNKNOWN\n3. src/api/codec.ts\n4. UNKNOWN\n5. Ignite\n6. UNKNOWN"
+    },
+    {
+      "session": 5,
+      "arm": "image-h2",
+      "chars": 8458,
+      "pages": 3,
+      "pageDims": [
+        "1516x716",
+        "1516x716",
+        "1516x196"
+      ],
+      "dropped": 22,
+      "graded": [
+        {
+          "probe": "缓存层最终选用了哪个方案？",
+          "expect": "DragonflyDB",
+          "hit": false,
+          "line": "1. UNKNOWN"
+        },
+        {
+          "probe": "网关的请求超时时间被调整为多少毫秒？",
+          "expect": "4800",
+          "hit": false,
+          "line": "2. UNKNOWN"
+        },
+        {
+          "probe": "那个 bug 的根因位于哪个文件？",
+          "expect": "src/api/codec.ts",
+          "hit": true,
+          "line": "3. src/api/codec.ts"
+        },
+        {
+          "probe": "该模块目前由谁负责维护？",
+          "expect": "王强",
+          "hit": false,
+          "line": "4. 王思"
+        },
+        {
+          "probe": "哪个组件已经被正式弃用？",
+          "expect": "Ignite",
+          "hit": true,
+          "line": "5. Ignite"
+        },
+        {
+          "probe": "数据库连接池的最大连接数被设置为多少？",
+          "expect": "UNKNOWN",
+          "hit": true,
+          "confab": false,
+          "line": "6. UNKNOWN"
+        }
+      ],
+      "nHit": 3,
+      "nConfab": 0,
+      "err": null,
+      "reply": "1. UNKNOWN\n2. UNKNOWN\n3. src/api/codec.ts\n4. 王思\n5. Ignite\n6. UNKNOWN"
+    }
+  ]
+}
